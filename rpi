@@ -1,0 +1,3404 @@
+#!/usr/bin/env python3
+"""
+predikta.py — PREDIKTA (Raspberry Pi) — SATU FILE
+Gabungan murni dari: config.py, database.py, sensor.py, prediksi.py, kirim_data.py,
+main.py (mode simulasi terbaru), prediksi_cnn_setup.py, dan dbs.py.
+Isi fungsi/kelas TIDAK diubah dari file aslinya.
+PENGECUALIAN: panel STATUS SENSOR (DS18B20, SHT31, PMS5003T) ditambahkan atas permintaan —
+hanya tampilan terminal + log; data yang disimpan/dikirim tidak berubah.
+PERUBAHAN TERBARU (simulasi PM): batas bawah PM = 0, batas atas PM = 150 masing-masing,
+dan urutan PM1.0 < PM2.5 < PM10 selalu dipaksa (lihat _paksa_urutan_pm).
+
+Menjalankan:
+  python predikta.py                       -> sama seperti menjalankan main.py yang diunggah
+  python predikta.py --gambar foto.png     -> sama seperti prediksi_cnn_setup.py --gambar foto.png
+  python predikta.py --preview             -> sama seperti prediksi_cnn_setup.py --preview
+  python predikta.py --dbs                 -> sama seperti menjalankan dbs.py
+"""
+
+import os
+import sys
+import json
+import time
+import math
+import random
+import sqlite3
+import argparse
+import logging
+import threading
+import warnings
+import numpy as np
+from datetime import datetime
+
+# ── Warna terminal (satu blok; nilainya sama dengan di file-file asli) ──
+BOLD   = "\033[1m";  HIJAU  = "\033[92m"; KUNING = "\033[93m"
+MERAH  = "\033[91m"; MERAH2 = "\033[31;1m"; CYAN  = "\033[96m"
+ABU    = "\033[90m"; RESET  = "\033[0m"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KONFIGURASI (config.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# config.py — Konfigurasi terpusat seluruh sistem PREDIKTA (Raspberry Pi)
+# Ubah nilai di sini untuk menyesuaikan dengan setup lapangan.
+#
+# CATATAN MIGRASI (SiPrediksi -> PREDIKTA):
+#   - Semua label/nama sistem diganti dari "SiPrediksi" menjadi "PREDIKTA".
+#   - API pengiriman data ke predikta.site TIDAK diubah (SERVER_URL & API_KEY tetap sama
+#     persis) agar file web (PHP) tidak perlu disentuh.
+#   - Ditambahkan sensor MQ-7 (CO) via modul ADC ADS1115.
+#   - Ditambahkan sensor CURAH HUJAN (tipping bucket, 3 pin: VCC 3V3, GND, PULSE) — lihat
+#     konfigurasi HUJAN_* di bawah & PENAMBAHAN_SENSOR_HUJAN.md.
+#   - Sistem HANYA mengirim data ke predikta.site (independen, satu server saja).
+#     Endpoint airprema.site/Bi-LSTM yang pernah ada sudah DIHAPUS TOTAL dari
+#     seluruh alur (config, database, kirim_data, simulasi) sesuai permintaan.
+#
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PATH & FOLDER
+# ═══════════════════════════════════════════════════════════════════
+
+BASE_DIR     = os.path.dirname(os.path.abspath(__file__))
+MODEL_DIR    = os.path.join(BASE_DIR, "models")
+DATA_DIR     = os.path.join(BASE_DIR, "data")
+LOG_DIR      = os.path.join(BASE_DIR, "logs")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LOKASI PERANGKAT (WAJIB diisi beda di tiap Raspberry Pi)
+# ═══════════════════════════════════════════════════════════════════
+# Dua unit PREDIKTA berjalan dengan kode/skema yang SAMA PERSIS, hanya
+# nilai ini yang berbeda. Nilai ini dikirim ke predikta.site bersama
+# setiap baris data (lihat kirim_data.py) supaya web bisa menyimpan &
+# menampilkan data per lokasi (Ketapang & Pontianak) secara terpisah.
+#
+# Nilai HARUS memakai salah satu key di LOKASI_INFO di bawah supaya
+# metadata (nama, kabupaten, dst) ikut terkirim dengan benar.
+LOKASI = "ketapang"   # unit ini terpasang di Ketapang — JANGAN diubah
+
+LOKASI_INFO = {
+    "ketapang": {
+        "nama"      : "BPBD Kabupaten Ketapang",
+        "kabupaten" : "Ketapang",
+        "provinsi"  : "Kalimantan Barat",
+    },
+    "pontianak": {
+        "nama"      : "BPBD Kota Pontianak",
+        "kabupaten" : "Pontianak",
+        "provinsi"  : "Kalimantan Barat",
+    },
+}
+
+# ── Path model ──────────────────────────────────────────────────
+MODEL_SVM    = os.path.join(MODEL_DIR, "model_svm.pkl")
+SCALER_SVM   = os.path.join(MODEL_DIR, "scaler.pkl")
+ENCODER_SVM  = os.path.join(MODEL_DIR, "label_encoder.pkl")
+
+MODEL_LSTM   = os.path.join(MODEL_DIR, "model_lstm.tflite")
+SCALER_LSTM  = os.path.join(MODEL_DIR, "scaler_lstm.pkl")
+SCALER_TARGET= os.path.join(MODEL_DIR, "scaler_target.pkl")
+ENCODER_LSTM = os.path.join(MODEL_DIR, "label_encoder_lstm.pkl")
+
+MODEL_CNN    = os.path.join(MODEL_DIR, "model_cnn.tflite")
+
+# ── Path data ────────────────────────────────────────────────────
+# NOTE: nama file database & antrian di-rename ke "predikta_*" (sebelumnya "siprediksi_*").
+# Kalau kamu mau mempertahankan histori data lama, salin isi siprediksi.db lama ke
+# predikta.db sebelum menjalankan sistem baru (skema tabel sama + kolom co_mq7 baru).
+DB_PATH      = os.path.join(DATA_DIR, "predikta.db")
+ANTRIAN_PATH = os.path.join(DATA_DIR, "antrian_kirim.json")   # antrian JSON dua-server
+DEFOR_PATH   = os.path.join(DATA_DIR, "deforestasi.json")
+LOG_PATH     = os.path.join(LOG_DIR,  "sistem.log")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TABEL PIN SENSOR (satu per satu) — PREDIKTA RPi 4 Model B
+# ═══════════════════════════════════════════════════════════════════
+# Dipakai untuk dokumentasi & ditampilkan lewat `python main.py --pinout`.
+# GPIO memakai penomoran BCM.
+#
+#  No | Sensor                    | Interface     | Pin / Alamat
+#  ---|---------------------------|---------------|--------------------------------
+#  1  | DS18B20 (suhu)            | 1-Wire        | GPIO4 (data), butuh resistor
+#     |                           |               | pull-up 4.7kΩ ke 3.3V, diaktifkan
+#     |                           |               | via dtoverlay=w1-gpio di config.txt
+#  2  | GY-SHT31 (kelembapan)     | I2C1          | SDA=GPIO2, SCL=GPIO3, alamat 0x44
+#  3  | PMS5003T (PM1.0/2.5/10)   | UART          | TX=GPIO14, RX=GPIO15, port /dev/ttyS0
+#  4  | JSN-SR04T (tinggi air)    | GPIO digital  | TRIG=GPIO23, ECHO=GPIO24
+#     |                           |               | (ECHO WAJIB via voltage divider ke 3.3V)
+#  5  | MQ-7 (CO) + ADS1115       | I2C1 (ADC)    | SDA=GPIO2, SCL=GPIO3, alamat 0x48
+#     |                           |               | (channel A0 / P0 pada ADS1115)
+#  6  | Curah hujan (tipping      | GPIO digital  | PULSE=GPIO17 (pin fisik 11), VCC=3V3, GND
+#     | bucket, 3 pin)            | (interrupt)   | (VCC 3V3 -> PULSE idle 3.3V, aman
+#     |                           |               | langsung ke GPIO, tanpa voltage divider)
+#
+# I2C1 (GPIO2/GPIO3) dipakai bersama oleh SHT31 (0x44) dan ADS1115 (0x48) —
+# tidak bentrok karena alamat I2C berbeda dan bus I2C mendukung banyak perangkat.
+PIN_TABLE = {
+    "DS18B20 (Suhu)": {
+        "interface": "1-Wire",
+        "pin"      : "GPIO4",
+        "catatan"  : "Butuh pull-up 4.7k ke 3.3V; aktifkan dtoverlay=w1-gpio",
+    },
+    "GY-SHT31 (Kelembapan)": {
+        "interface": "I2C1",
+        "sda"      : "GPIO2 (SDA1)",
+        "scl"      : "GPIO3 (SCL1)",
+        "alamat"   : "0x44",
+    },
+    "PMS5003T (PM1.0/PM2.5/PM10)": {
+        "interface": "UART",
+        "tx"       : "GPIO14 (TXD0)",
+        "rx"       : "GPIO15 (RXD0)",
+        "port"     : "/dev/ttyS0",
+    },
+    "JSN-SR04T (Tinggi air)": {
+        "interface": "GPIO digital",
+        "trig"     : "GPIO23",
+        "echo"     : "GPIO24",
+        "catatan"  : "ECHO wajib pakai voltage divider (5V -> 3.3V)",
+    },
+    "MQ-7 (CO) via ADS1115": {
+        "interface": "I2C1 (ADC eksternal)",
+        "sda"      : "GPIO2 (SDA1)",
+        "scl"      : "GPIO3 (SCL1)",
+        "alamat"   : "0x48",
+        "channel"  : "A0 / P0",
+    },
+    "Curah Hujan (Tipping Bucket)": {
+        "interface": "GPIO digital (interrupt)",
+        "vcc"      : "3V3 (pin fisik 1 atau 17)",
+        "gnd"      : "GND (mis. pin fisik 9)",
+        "pulse"    : "GPIO17 (pin fisik 11)",
+        "catatan"  : "Sensor dicatu 3V3, jadi PULSE idle 3.3V dan aman langsung ke GPIO17 (tanpa voltage divider)",
+    },
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KONFIGURASI SENSOR
+# ═══════════════════════════════════════════════════════════════════
+
+# JSN-SR04T
+TRIG_PIN     = 23
+ECHO_PIN     = 24
+ECHO_TIMEOUT = 0.03
+
+# GY-SHT31
+SHT31_BUS    = 1
+SHT31_ADDR   = 0x44
+
+# PMS5003T
+PMS_PORT     = "/dev/ttyS0"   # ganti ke /dev/ttyAMA0 jika perlu
+PMS_BAUD     = 9600
+PMS_TIMEOUT  = 5
+
+# DS18B20
+W1_BASE      = "/sys/bus/w1/devices/"
+W1_PREFIX    = "28-"
+
+# MQ-7 via ADS1115 (baru)
+MQ7_ENABLE        = True    # set False untuk menonaktifkan pembacaan MQ-7 sepenuhnya
+MQ7_ADS1115_ADDR  = 0x48    # alamat I2C default modul ADS1115 (ADDR ke GND)
+MQ7_ADS1115_BUS   = 1
+MQ7_CHANNEL       = 0       # channel single-ended: 0=A0, 1=A1, 2=A2, 3=A3
+MQ7_GAIN          = 1       # gain ADS1115 (1 = ±4.096V, cocok utk output MQ-7 0-5V yang
+                            # sudah dibagi tegangan / modul ber-VCC 3.3V)
+
+# Kalibrasi kurva CO MQ-7 (WAJIB dikalibrasi ulang di lapangan seperti JARAK_SENSOR_KE_DASAR
+# untuk JSN-SR04T). Nilai di bawah adalah titik awal umum dari datasheet, bukan hasil
+# kalibrasi presisi.
+MQ7_RL            = 10.0    # kOhm, resistor beban di modul (cek datasheet modul yang dipakai)
+MQ7_R0             = 10.0   # kOhm, resistansi sensor di udara bersih (HARUS dikalibrasi ulang)
+MQ7_CURVE_M        = -0.77  # slope kurva log-log ppm vs Rs/R0 (referensi datasheet MQ-7)
+MQ7_CURVE_B        = 0.65   # intercept kurva log-log
+
+# ── Sensor CURAH HUJAN (tipping bucket, 3 pin: VCC 3V3 / GND / PULSE) — BARU ──
+# Setiap ember terjungkit = 1 pulsa. Curah hujan (mm/jam) dihitung dari jumlah
+# pulsa sejak pembacaan sebelumnya (rata-rata selama INTERVAL_BACA, default 5 menit):
+#     mm/jam = pulsa * HUJAN_MM_PER_PULSE * 3600 / durasi_detik
+# Nilai curah_hujan TIDAK masuk FITUR_INPUT/FITUR_SVM (model SVM/LSTM/CNN lama tidak
+# diubah). Klasifikasinya pakai THRESHOLD biasa (bukan model), lihat prediksi.py.
+HUJAN_ENABLE          = True
+# ── SAKLAR SEMENTARA baca sensor hujan ──────────────────────────────────
+# False -> sensor hujan TIDAK dibaca: curah_hujan = 0 dan prediksinya = 0 (terus-menerus).
+# True  -> sensor dibaca normal (GPIO17 dipakai / dummy kalau MODE_DUMMY=True).
+# Ubah nilai di bawah ini langsung di kode (tanpa menu), lalu jalankan ulang program.
+HUJAN_BACA_SENSOR     = False
+HUJAN_STATE           = {"baca": HUJAN_BACA_SENSOR}   # dipakai bersama sensor.py, prediksi.py, main.py
+HUJAN_PIN             = 17      # GPIO (BCM) untuk kabel PULSE
+HUJAN_MM_PER_PULSE    = 0.2794  # mm air per 1 pulsa — WAJIB dikalibrasi sesuai sensor
+                                # (umum: 0.2794 / 0.25 / 0.2; cek datasheet atau tuang
+                                #  air ukur ke corong lalu hitung jumlah pulsa)
+HUJAN_PULL            = "UP"    # "UP" / "DOWN" / "NONE" — resistor internal RPi di pin PULSE
+HUJAN_EDGE            = "FALLING"   # "FALLING" / "RISING" / "BOTH" — tepi yang dihitung
+HUJAN_BOUNCETIME_MS   = 50      # debounce (ms), cegah 1 jungkitan terhitung ganda
+HUJAN_DURASI_MIN_DETIK = 60     # batas bawah durasi pembagi (cegah lonjakan palsu
+                                # kalau dibaca sesaat setelah program start)
+
+# Threshold klasifikasi curah hujan (mm/jam) — TANPA model:
+#   0 <= x < 5   -> Aman      | 5 <= x < 10 -> Waspada
+#   10 <= x <= 20 -> Siaga    | x > 20      -> Bahaya
+HUJAN_BATAS_WASPADA   = 5.0
+HUJAN_BATAS_SIAGA     = 10.0
+HUJAN_BATAS_BAHAYA    = 20.0    # batas ATAS Siaga (inklusif); di atas ini = Bahaya
+
+# Confidence klasifikasi hujan di-generate ACAK (bukan hasil model), dalam persen
+HUJAN_CONF_MIN        = 40.0
+HUJAN_CONF_MAX        = 96.0
+# Prediksi curah hujan = nilai sensor + acak, maksimal selisih +-HUJAN_PRED_DELTA_MAX
+# (tidak pernah negatif). BUKAN hasil LSTM.
+HUJAN_PRED_DELTA_MAX  = 8.0
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KONFIGURASI SISTEM
+# ═══════════════════════════════════════════════════════════════════
+
+# Interval baca sensor (detik)
+INTERVAL_BACA      = 30   # 5 menit
+
+# Interval kirim data ke server (detik)
+# Boleh lebih jarang dari baca sensor untuk hemat kuota
+INTERVAL_KIRIM     = 30
+
+# Mode dummy — True = gunakan data sensor palsu (untuk testing tanpa hardware)
+# 🔹 True  = mode dummy (testing di laptop, tidak perlu sensor fisik)
+# 🔹 False = mode nyata (gunakan sensor fisik DS18B20, SHT31, PMS5003T, JSN-SR04T, MQ-7)
+MODE_DUMMY         = False   # ← ganti False saat sensor sudah terpasang
+
+# Mode simulasi/demo (lihat simulasi.py) — SAKLAR KODE, alternatif dari flag
+# CLI "--simulasi" (berguna kalau dijalankan dari Thonny/IDE lewat F5 tanpa
+# argumen). True = jalankan mode simulasi. Kalau False, cek juga argumen CLI
+# --simulasi saat dijalankan lewat command line — salah satu True saja cukup.
+# JANGAN aktifkan True bersamaan di server produksi tanpa sadar; data
+# simulasi ikut terkirim ke predikta.site (lihat simulasi.py).
+MODE_SIMULASI      = True   # ← ganti True untuk aktifkan mode simulasi lewat kode
+
+# Fitur input SVM & LSTM (urutan HARUS konsisten) — TIDAK berubah dari sebelumnya.
+# MQ-7/CO SENGAJA TIDAK dimasukkan ke sini karena model SVM/LSTM/CNN yang sudah
+# dilatih (untuk predikta.site) memakai 6 fitur ini + prob_deforestasi. Menambah CO
+# ke vektor ini akan membuat prediksi model lama salah tanpa retraining.
+FITUR_INPUT  = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10", "tinggi_air"]
+FITUR_TARGET = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10", "tinggi_air"]
+
+# Fitur khusus untuk SVM produksi — 6 sensor + probabilitas deforestasi dari CNN
+# (total 7 fitur). Ini WAJIB sama persis (nama & URUTAN) dengan fitur yang
+# dipakai saat scaler.pkl / model_svm.pkl dilatih — kalau urutannya beda,
+# error "X has N features" akan hilang tapi hasil prediksi bisa tetap salah
+# secara diam-diam. Konfirmasi ke skrip training kalau ragu.
+FITUR_SVM    = FITUR_INPUT + ["prob_deforestasi"]
+
+# Parameter LSTM
+TIMESTEP     = 10   # harus sama dengan saat training
+HORIZON      = 3    # harus sama dengan saat training
+
+# Kelas risiko (urutan dari aman ke bahaya)
+KELAS_RISIKO = ["Aman", "Waspada", "Siaga", "Bahaya"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODEL SVM PER KLASIFIKASI BENCANA (BARU)
+# ═══════════════════════════════════════════════════════════════════
+# Selain SVM "umum" di atas (status_risiko gabungan, 6 fitur sensor +
+# prob_deforestasi -> FITUR_SVM), sistem sekarang JUGA menjalankan SVM
+# terpisah untuk tiap jenis bencana, masing-masing dengan model &
+# fitur sendiri. Deforestasi TETAP memakai CNN (deforestasi.json),
+# TIDAK diganti SVM.
+#
+# BARU — klasifikasi kebakaran/banjir/pencemaran udara TIDAK LAGI memakai
+# model SVM (.pkl). Diganti klasifikasi berbasis THRESHOLD tetap di bawah;
+# tidak ada file model/scaler/encoder yang perlu disiapkan untuk ketiganya.
+# (MODEL_SVM_KEBAKARAN dkk. di bawah TIDAK dipakai lagi, dibiarkan sebagai
+# dokumentasi kalau suatu saat mau kembali ke model.)
+
+# ── Kebakaran (fitur: suhu, kelembapan) ─────────────────────────
+MODEL_SVM_KEBAKARAN  = os.path.join(MODEL_DIR, "model_svm_kebakaran.pkl")
+SCALER_KEBAKARAN     = os.path.join(MODEL_DIR, "scaler_kebakaran.pkl")
+ENCODER_KEBAKARAN    = os.path.join(MODEL_DIR, "label_encoder_kebakaran.pkl")
+FITUR_KEBAKARAN      = ["suhu", "kelembapan"]
+
+# ── Banjir (fitur: tinggi_air) ───────────────────────────────────
+MODEL_SVM_BANJIR     = os.path.join(MODEL_DIR, "model_svm_banjir.pkl")
+SCALER_BANJIR        = os.path.join(MODEL_DIR, "scaler_banjir.pkl")
+ENCODER_BANJIR       = os.path.join(MODEL_DIR, "label_encoder_banjir.pkl")
+FITUR_BANJIR         = ["tinggi_air"]
+
+# ── Pencemaran Udara (fitur: pm1_0, pm2_5, pm10 — TANPA co, karena
+#    co/MQ-7 tidak termasuk fitur yang dipakai model SVM pencemaran) ──
+MODEL_SVM_PENCEMARAN = os.path.join(MODEL_DIR, "model_svm_pencemaran.pkl")
+SCALER_PENCEMARAN    = os.path.join(MODEL_DIR, "scaler_pencemaran.pkl")
+ENCODER_PENCEMARAN   = os.path.join(MODEL_DIR, "label_encoder_pencemaran.pkl")
+FITUR_PENCEMARAN     = ["pm1_0", "pm2_5", "pm10"]
+
+# Label kelas tiap model bencana baru — SAMA dengan KELAS_RISIKO umum
+# (Aman/Waspada/Siaga/Bahaya). Dipakai sebagai referensi/dokumentasi;
+# label sesungguhnya tetap datang dari label_encoder masing-masing.
+KELAS_RISIKO_BENCANA = KELAS_RISIKO
+
+# ═══════════════════════════════════════════════════════════════════
+# THRESHOLD KLASIFIKASI PER BENCANA (BARU) — pengganti model SVM
+# ═══════════════════════════════════════════════════════════════════
+# Format tiap tabel: list (status, batas_bawah_inklusif, batas_atas_eksklusif)
+# terurut NILAI NAIK. None = tak terbatas (ujung kelas terbuka).
+#
+# Confidence: SEMAKIN KE TENGAH rentang levelnya, confidence semakin TINGGI;
+# semakin dekat ke batas antar-level (ambigu dgn level tetangga), confidence
+# semakin RENDAH (skala BENCANA_CONF_MIN..BENCANA_CONF_MAX). Untuk level
+# yang ujungnya terbuka (Aman paling bawah / Bahaya paling atas), sebagai
+# acuan skala dipakai lebar level tetangga yang terdekat.
+BENCANA_CONF_MIN = 50.0
+BENCANA_CONF_MAX = 99.0
+
+# Kebakaran — suhu (°C)
+THRESHOLD_SUHU = [
+    ("Aman",    None, 30),
+    ("Waspada", 30,   35),
+    ("Siaga",   35,   40),
+    ("Bahaya",  40,   None),
+]
+# Kebakaran — kelembapan (%RH) — arah TERBALIK (makin tinggi RH makin aman)
+THRESHOLD_KELEMBAPAN = [
+    ("Bahaya",  None, 30),
+    ("Siaga",   30,   50),
+    ("Waspada", 50,   70),
+    ("Aman",    70,   None),
+]
+# Banjir — tinggi air (cm)
+THRESHOLD_TINGGI_AIR = [
+    ("Aman",    None, 20),
+    ("Waspada", 20,   50),
+    ("Siaga",   50,   80),
+    ("Bahaya",  80,   None),
+]
+# Pencemaran udara — PM1.0 (µg/m³)
+THRESHOLD_PM1_0 = [
+    ("Aman",    None, 15),
+    ("Waspada", 15,   35),
+    ("Siaga",   35,   55),
+    ("Bahaya",  55,   None),
+]
+# Pencemaran udara — PM2.5 (µg/m³)
+THRESHOLD_PM2_5 = [
+    ("Aman",    None, 15),
+    ("Waspada", 15,   35),
+    ("Siaga",   35,   55),
+    ("Bahaya",  55,   None),
+]
+# Pencemaran udara — PM10 (µg/m³)
+THRESHOLD_PM10 = [
+    ("Aman",    None, 45),
+    ("Waspada", 45,   75),
+    ("Siaga",   75,   150),
+    ("Bahaya",  150,  None),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KLASIFIKASI UTAMA (BARU) — skor tertimbang 6 parameter
+# ═══════════════════════════════════════════════════════════════════
+# Menggantikan PrediksiSVM umum. Tiap parameter diberi level 0..3
+# (Aman=0, Waspada=1, Siaga=2, Bahaya=3) dari tabel THRESHOLD_UTAMA, lalu
+# skor = jumlah(bobot x level). Skor 0..3 dibulatkan ke level terdekat.
+# Tabel ini TERPISAH dari THRESHOLD_* per bencana di atas (yang tidak diubah).
+#
+# Format tabel sama dengan THRESHOLD_* di atas: (status, batas_bawah_inklusif,
+# batas_atas_eksklusif), None = tak terbatas.
+BOBOT_UTAMA = {
+    "pm2_5"      : 0.25,
+    "pm10"       : 0.20,
+    "pm1_0"      : 0.10,
+    "tinggi_air" : 0.20,
+    "suhu"       : 0.15,
+    "kelembapan" : 0.10,
+}   # total harus 1.00
+
+# Batas skor antar-kelas: skor < 0.5 Aman | < 1.5 Waspada | < 2.5 Siaga | selebihnya Bahaya
+SKOR_BATAS_UTAMA = [0.5, 1.5, 2.5]
+
+# Parameter yang masuk level Bahaya bobotnya dikali PENGGANDA_BAHAYA, lalu seluruh bobot
+# dinormalisasi ulang ke total 100% -> bobot parameter lain otomatis turun.
+PENGGANDA_BAHAYA = 2.0
+
+# tinggi_air di seluruh sistem berstatus cm, sedangkan tabel threshold utama dalam METER
+TINGGI_AIR_CM_KE_M = 0.01
+
+THRESHOLD_UTAMA = {
+    # °C — di bawah 20 °C tidak ada di tabel, diperlakukan Aman
+    "suhu": [
+        ("Aman",    None, 30),
+        ("Waspada", 30,   33),
+        ("Siaga",   33,   36),
+        ("Bahaya",  36,   None),
+    ],
+    # %RH — dua sisi (terlalu kering maupun terlalu lembap sama-sama berisiko)
+    "kelembapan": [
+        ("Bahaya",  None, 20),
+        ("Siaga",   20,   30),
+        ("Waspada", 30,   40),
+        ("Aman",    40,   70),
+        ("Waspada", 70,   80),
+        ("Siaga",   80,   90),
+        ("Bahaya",  90,   None),
+    ],
+    # meter (nilai sensor cm dikonversi dulu)
+    "tinggi_air": [
+        ("Aman",    None, 0.50),
+        ("Waspada", 0.50, 0.75),
+        ("Siaga",   0.75, 1.00),
+        ("Bahaya",  1.00, None),
+    ],
+    # µg/m³
+    "pm1_0": [
+        ("Aman",    None, 25),
+        ("Waspada", 25,   50),
+        ("Siaga",   50,   100),
+        ("Bahaya",  100,  None),
+    ],
+    "pm2_5": [
+        ("Aman",    None, 35),
+        ("Waspada", 35,   55),
+        ("Siaga",   55,   110),
+        ("Bahaya",  110,  None),
+    ],
+    "pm10": [
+        ("Aman",    None, 50),
+        ("Waspada", 50,   75),
+        ("Siaga",   75,   150),
+        ("Bahaya",  150,  None),
+    ],
+}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODE SIMULASI/DEMO (python main.py --simulasi) — HANYA untuk testing
+# end-to-end pipeline & dashboard website, BUKAN evaluasi akurasi LSTM.
+# Lihat simulasi.py untuk detail alur. TIDAK memengaruhi mode normal/dummy.
+#
+# Sejak revisi ini, mode simulasi HANYA independen untuk predikta.site
+# (Jalur B/airprema.site sudah dihapus total dari seluruh sistem), dan
+# nilai "data simulasi" tiap siklus dihitung dari pembacaan sensor
+# REAL/dummy (baca_sensor() dipanggil lebih dulu) yang ditarik ke arah
+# forecast (prediksi) — lihat simulasi.py generate_data_simulasi().
+# ═══════════════════════════════════════════════════════════════════
+
+# Jumlah horizon prediksi sintetis per batch (terpisah dari HORIZON milik LSTM asli)
+SIMULASI_HORIZON     = 6
+
+# ── Distribusi akurasi (prediksi vs simulasi) — 5 PITA ───────────────
+# Dipakai oleh generate_akurasi_baru() di simulasi.py untuk menentukan
+# seberapa jauh "data simulasi" (nilai aktual yang dilaporkan) boleh
+# menyimpang dari "data prediksi" (forecast H+1), sebelum ditarik lagi
+# ke arah pembacaan sensor real/dummy siklus ini.
+#
+# Format: list of (akurasi_min, akurasi_max, probabilitas), probabilitas
+# HARUS berjumlah 1.0. Sesuai permintaan:
+#   10% di rentang 50%-60%
+#   10% di rentang 60%-70%
+#   20% di rentang 70%-80%
+#   40% di rentang 80%-90%
+#   20% di rentang 90%-99%
+SIMULASI_PREDIKTA_AKURASI = [
+    (0.50, 0.60, 0.10),
+    (0.60, 0.70, 0.10),
+    (0.70, 0.80, 0.20),
+    (0.80, 0.90, 0.40),
+    (0.90, 0.99, 0.20),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KONFIGURASI SERVER — HANYA predikta.site (independen, satu server)
+# ═══════════════════════════════════════════════════════════════════
+
+# PENTING: URL & API KEY di bawah TIDAK DIUBAH dari versi SiPrediksi sebelumnya
+# supaya file PHP di server tidak perlu disentuh sama sekali.
+SERVER_URL       = "https://predikta.site/api/terima_data.php"
+API_KEY          = "siprediksi_secret_key_2024"
+
+# Timeout request HTTP (detik)
+HTTP_TIMEOUT     = 15
+
+# Maksimal data dalam antrian offline (JSON)
+MAX_ANTRIAN      = 1000
+
+
+# ═══════════════════════════════════════════════════════════════════
+# BUAT FOLDER JIKA BELUM ADA
+# ═══════════════════════════════════════════════════════════════════
+
+for folder in [MODEL_DIR, DATA_DIR, LOG_DIR]:
+    os.makedirs(folder, exist_ok=True)
+
+
+# ── Logging (basicConfig yang sama di tiap file asli; hanya satu yang berlaku) ──
+logging.basicConfig(
+    filename = LOG_PATH,
+    level    = logging.INFO,
+    format   = "%(asctime)s [%(levelname)s] %(message)s",
+)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATABASE (database.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# database.py — Manajemen database SQLite lokal + antrian JSON (PREDIKTA)
+#
+# Tabel SQLite:
+#   sensor_log : semua data pembacaan + hasil prediksi (histori permanen, lokal)
+#   kirim_log  : log status pengiriman ke server
+#
+# Antrian JSON:
+#   data/antrian_kirim.json — setiap siklus dituliskan sebagai satu entri JSON.
+#   Entri ini dipakai sebagai sumber pengiriman ke predikta.site (SATU server,
+#   independen) — kalau pengiriman gagal, entri tetap ada di antrian sampai
+#   berhasil terkirim di siklus berikutnya.
+#
+
+
+# ═══════════════════════════════════════════════════════════════════
+# INISIALISASI DATABASE
+# ═══════════════════════════════════════════════════════════════════
+
+def init_db():
+    """
+    Buat tabel jika belum ada, dan migrasi kolom baru (co_mq7) jika perlu.
+    Dipanggil sekali saat startup main.py.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+
+    # Tabel utama: data sensor + hasil prediksi
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sensor_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp       TEXT NOT NULL,
+
+            -- Lokasi perangkat (BARU) — "ketapang" / "pontianak", lihat config.LOKASI
+            lokasi          TEXT DEFAULT 'ketapang',
+
+            -- Data sensor
+            suhu            REAL,
+            kelembapan      REAL,
+            pm1_0           REAL,
+            pm2_5           REAL,
+            pm10            REAL,
+            tinggi_air      REAL,
+            co_mq7          REAL,
+            curah_hujan     REAL,   -- mm/jam (sensor hujan, BARU)
+            sumber          TEXT DEFAULT 'sensor',
+
+            -- Hasil SVM umum (status risiko gabungan, TIDAK berubah)
+            status_risiko   TEXT,
+            confidence_svm  REAL,
+            prob_aman       REAL,
+            prob_waspada    REAL,
+            prob_siaga      REAL,
+            prob_bahaya     REAL,
+
+            -- Hasil LSTM (JSON string)
+            prediksi_nilai  TEXT,   -- JSON: {suhu:[...], kelembapan:[...], ...}
+            prediksi_status TEXT,   -- JSON: ["Aman", "Waspada", ...]
+
+            -- LSTM -> SVM pipeline (prediksi risiko dari nilai prediksi sensor)
+            prediksi_risiko_status      TEXT,
+            prediksi_risiko_confidence  REAL,
+
+            -- Data CNN (tetap, dari deforestasi.json)
+            status_deforestasi  TEXT,
+            prob_deforestasi    REAL,
+
+            -- ── Klasifikasi PER BENCANA (BARU) — masing-masing dari SVM sendiri ──
+            -- Kebakaran (fitur: suhu, kelembapan)
+            status_kebakaran        TEXT,
+            confidence_kebakaran    REAL,
+            prob_kebakaran_aman     REAL,
+            prob_kebakaran_waspada  REAL,
+            prob_kebakaran_siaga    REAL,
+            prob_kebakaran_bahaya   REAL,
+
+            -- Banjir (fitur: tinggi_air)
+            status_banjir           TEXT,
+            confidence_banjir       REAL,
+            prob_banjir_aman        REAL,
+            prob_banjir_waspada     REAL,
+            prob_banjir_siaga       REAL,
+            prob_banjir_bahaya      REAL,
+
+            -- Pencemaran udara (fitur: pm1_0, pm2_5, pm10)
+            status_pencemaran       TEXT,
+            confidence_pencemaran   REAL,
+            prob_pencemaran_aman    REAL,
+            prob_pencemaran_waspada REAL,
+            prob_pencemaran_siaga   REAL,
+            prob_pencemaran_bahaya  REAL,
+
+            -- Curah hujan (BARU) — threshold biasa; confidence & prediksi acak
+            status_hujan            TEXT,
+            confidence_hujan        REAL,
+            prediksi_curah_hujan    REAL,
+            prediksi_status_hujan   TEXT,
+
+            -- Status pengiriman ke server (legacy, histori lokal)
+            terkirim        INTEGER DEFAULT 0,  -- 0=belum, 1=sudah
+            waktu_kirim     TEXT
+        )
+    """)
+
+    # Tabel log pengiriman
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS kirim_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp   TEXT NOT NULL,
+            target      TEXT,   -- 'predikta'
+            status      TEXT,   -- 'sukses' / 'gagal'
+            pesan       TEXT,
+            n_data      INTEGER DEFAULT 0
+        )
+    """)
+
+    conn.commit()
+
+    # ── Migrasi kolom baru untuk database lama (mis. dari siprediksi.db lama) ──
+    c.execute("PRAGMA table_info(sensor_log)")
+    kolom_ada = [row[1] for row in c.fetchall()]
+    if "co_mq7" not in kolom_ada:
+        c.execute("ALTER TABLE sensor_log ADD COLUMN co_mq7 REAL")
+        conn.commit()
+        logging.info("Migrasi: kolom co_mq7 ditambahkan ke sensor_log")
+
+    # Migrasi kolom BARU: lokasi + klasifikasi per bencana (kebakaran/banjir/
+    # pencemaran udara), untuk database lama yang dibuat sebelum fitur ini ada.
+    kolom_baru = {
+        "lokasi"                : "TEXT DEFAULT 'ketapang'",
+        "curah_hujan"           : "REAL",
+        "status_hujan"          : "TEXT",
+        "confidence_hujan"      : "REAL",
+        "prediksi_curah_hujan"  : "REAL",
+        "prediksi_status_hujan" : "TEXT",
+        "status_kebakaran"      : "TEXT",
+        "confidence_kebakaran"  : "REAL",
+        "prob_kebakaran_aman"   : "REAL",
+        "prob_kebakaran_waspada": "REAL",
+        "prob_kebakaran_siaga"  : "REAL",
+        "prob_kebakaran_bahaya" : "REAL",
+        "status_banjir"         : "TEXT",
+        "confidence_banjir"     : "REAL",
+        "prob_banjir_aman"      : "REAL",
+        "prob_banjir_waspada"   : "REAL",
+        "prob_banjir_siaga"     : "REAL",
+        "prob_banjir_bahaya"    : "REAL",
+        "status_pencemaran"       : "TEXT",
+        "confidence_pencemaran"   : "REAL",
+        "prob_pencemaran_aman"    : "REAL",
+        "prob_pencemaran_waspada" : "REAL",
+        "prob_pencemaran_siaga"   : "REAL",
+        "prob_pencemaran_bahaya"  : "REAL",
+    }
+    for kolom, tipe in kolom_baru.items():
+        if kolom not in kolom_ada:
+            c.execute(f"ALTER TABLE sensor_log ADD COLUMN {kolom} {tipe}")
+            conn.commit()
+            logging.info(f"Migrasi: kolom {kolom} ditambahkan ke sensor_log")
+
+    c.execute("PRAGMA table_info(kirim_log)")
+    kolom_kirim = [row[1] for row in c.fetchall()]
+    if "target" not in kolom_kirim:
+        c.execute("ALTER TABLE kirim_log ADD COLUMN target TEXT")
+        conn.commit()
+        logging.info("Migrasi: kolom target ditambahkan ke kirim_log")
+
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SIMPAN DATA (SQLite — histori permanen)
+# ═══════════════════════════════════════════════════════════════════
+
+def simpan_data(data_sensor, hasil_svm, hasil_lstm, data_defor, hasil_prediksi_risiko=None,
+                 hasil_kebakaran=None, hasil_banjir=None, hasil_pencemaran=None,
+                 hasil_hujan=None):
+    """
+    Simpan satu baris pembacaan lengkap ke SQLite.
+
+    Parameter:
+        data_sensor             : dict dari sensor.py (termasuk co_mq7 jika ada)
+        hasil_svm               : dict {status, confidence, prob_aman, ...} (SVM umum)
+        hasil_lstm              : dict {prediksi_nilai, prediksi_status}
+                                  atau None jika belum cukup data
+        data_defor              : dict dari deforestasi.json
+        hasil_prediksi_risiko   : dict {status, confidence} dari LSTM -> SVM pipeline
+        hasil_kebakaran         : dict {status, confidence, prob} dari SVM kebakaran (BARU)
+        hasil_banjir            : dict {status, confidence, prob} dari SVM banjir (BARU)
+        hasil_pencemaran        : dict {status, confidence, prob} dari SVM pencemaran udara (BARU)
+        hasil_hujan             : dict {status, confidence, prediksi_nilai, prediksi_status} dari
+                                  prediksi.analisis_hujan() (BARU; threshold + acak, bukan model)
+
+    Return: id baris yang baru disimpan (dipakai untuk korelasi log, opsional).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+
+    # Serialisasi prediksi LSTM ke JSON
+    pred_nilai  = json.dumps(hasil_lstm.get("prediksi_nilai"))  if hasil_lstm else None
+    pred_status = json.dumps(hasil_lstm.get("prediksi_status")) if hasil_lstm else None
+
+    hasil_kebakaran  = hasil_kebakaran  or {}
+    hasil_banjir     = hasil_banjir     or {}
+    hasil_pencemaran = hasil_pencemaran or {}
+    hasil_hujan      = hasil_hujan      or {}
+
+    c.execute("""
+        INSERT INTO sensor_log (
+            timestamp, lokasi, suhu, kelembapan, pm1_0, pm2_5, pm10,
+            tinggi_air, co_mq7, sumber,
+            status_risiko, confidence_svm,
+            prob_aman, prob_waspada, prob_siaga, prob_bahaya,
+            prediksi_nilai, prediksi_status,
+            prediksi_risiko_status, prediksi_risiko_confidence,
+            status_deforestasi, prob_deforestasi,
+            status_kebakaran, confidence_kebakaran,
+            prob_kebakaran_aman, prob_kebakaran_waspada, prob_kebakaran_siaga, prob_kebakaran_bahaya,
+            status_banjir, confidence_banjir,
+            prob_banjir_aman, prob_banjir_waspada, prob_banjir_siaga, prob_banjir_bahaya,
+            status_pencemaran, confidence_pencemaran,
+            prob_pencemaran_aman, prob_pencemaran_waspada, prob_pencemaran_siaga, prob_pencemaran_bahaya,
+            curah_hujan, status_hujan, confidence_hujan, prediksi_curah_hujan, prediksi_status_hujan
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,
+                  ?,?,?,?,?,?,
+                  ?,?,?,?,?,?,
+                  ?,?,?,?,?,?,
+                  ?,?,?,?,?)
+    """, (
+        data_sensor.get("timestamp"),
+        LOKASI,
+        data_sensor.get("suhu"),
+        data_sensor.get("kelembapan"),
+        data_sensor.get("pm1_0"),
+        data_sensor.get("pm2_5"),
+        data_sensor.get("pm10"),
+        data_sensor.get("tinggi_air"),
+        data_sensor.get("co_mq7"),
+        data_sensor.get("sumber", "sensor"),
+        hasil_svm.get("status"),
+        hasil_svm.get("confidence"),
+        hasil_svm.get("prob", {}).get("Aman"),
+        hasil_svm.get("prob", {}).get("Waspada"),
+        hasil_svm.get("prob", {}).get("Siaga"),
+        hasil_svm.get("prob", {}).get("Bahaya"),
+        pred_nilai,
+        pred_status,
+        hasil_prediksi_risiko.get("status") if hasil_prediksi_risiko else None,
+        hasil_prediksi_risiko.get("confidence") if hasil_prediksi_risiko else None,
+        data_defor.get("status_deforestasi"),
+        data_defor.get("prob_deforestasi"),
+        hasil_kebakaran.get("status"),
+        hasil_kebakaran.get("confidence"),
+        hasil_kebakaran.get("prob", {}).get("Aman"),
+        hasil_kebakaran.get("prob", {}).get("Waspada"),
+        hasil_kebakaran.get("prob", {}).get("Siaga"),
+        hasil_kebakaran.get("prob", {}).get("Bahaya"),
+        hasil_banjir.get("status"),
+        hasil_banjir.get("confidence"),
+        hasil_banjir.get("prob", {}).get("Aman"),
+        hasil_banjir.get("prob", {}).get("Waspada"),
+        hasil_banjir.get("prob", {}).get("Siaga"),
+        hasil_banjir.get("prob", {}).get("Bahaya"),
+        hasil_pencemaran.get("status"),
+        hasil_pencemaran.get("confidence"),
+        hasil_pencemaran.get("prob", {}).get("Aman"),
+        hasil_pencemaran.get("prob", {}).get("Waspada"),
+        hasil_pencemaran.get("prob", {}).get("Siaga"),
+        hasil_pencemaran.get("prob", {}).get("Bahaya"),
+        data_sensor.get("curah_hujan"),
+        hasil_hujan.get("status"),
+        hasil_hujan.get("confidence"),
+        hasil_hujan.get("prediksi_nilai"),
+        hasil_hujan.get("prediksi_status"),
+    ))
+
+    last_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return last_id
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ANTRIAN JSON — sumber pengiriman ke DUA server
+# ═══════════════════════════════════════════════════════════════════
+
+def _muat_antrian():
+    """Muat antrian JSON. Kembalikan list kosong jika belum ada / rusak."""
+    if not os.path.exists(ANTRIAN_PATH):
+        return []
+    try:
+        with open(ANTRIAN_PATH, "r") as f:
+            isi = json.load(f)
+        return isi if isinstance(isi, list) else []
+    except Exception as e:
+        logging.error(f"Gagal baca antrian JSON, mulai dari kosong: {e}")
+        return []
+
+
+def _simpan_antrian(antrian: list):
+    """Tulis ulang seluruh antrian JSON (atomic-ish via file sementara)."""
+    tmp_path = ANTRIAN_PATH + ".tmp"
+    try:
+        with open(tmp_path, "w") as f:
+            json.dump(antrian, f, indent=2)
+        os.replace(tmp_path, ANTRIAN_PATH)
+    except Exception as e:
+        logging.error(f"Gagal simpan antrian JSON: {e}")
+
+
+def tambah_antrian(data_sensor, hasil_svm, hasil_lstm, data_defor,
+                    hasil_prediksi_risiko=None, row_id=None,
+                    hasil_kebakaran=None, hasil_banjir=None, hasil_pencemaran=None,
+                    hasil_hujan=None):
+    """
+    Tambahkan satu entri baru ke antrian JSON (dipanggil tiap siklus dari main.py,
+    setelah simpan_data). Entri ini yang nanti dibaca kirim_data.py untuk dikirim
+    ke predikta.site (SATU server, independen).
+    """
+    entri = {
+        "row_id"    : row_id,
+        "timestamp" : data_sensor.get("timestamp"),
+        "lokasi"    : LOKASI,   # dikirim ke predikta.site agar web bisa filter per lokasi
+        "sensor"    : {
+            "suhu"       : data_sensor.get("suhu"),
+            "kelembapan" : data_sensor.get("kelembapan"),
+            "pm1_0"      : data_sensor.get("pm1_0"),
+            "pm2_5"      : data_sensor.get("pm2_5"),
+            "pm10"       : data_sensor.get("pm10"),
+            "tinggi_air" : data_sensor.get("tinggi_air"),
+            "co_mq7"     : data_sensor.get("co_mq7"),
+            "curah_hujan": data_sensor.get("curah_hujan"),   # mm/jam (BARU)
+            "sumber"     : data_sensor.get("sumber", "sensor"),
+        },
+        "svm"      : hasil_svm or {},
+        "lstm"     : hasil_lstm or {},
+        "prediksi_risiko": hasil_prediksi_risiko or {},
+        "cnn"      : {
+            "status_deforestasi": data_defor.get("status_deforestasi"),
+            "prob_deforestasi"  : data_defor.get("prob_deforestasi"),
+        },
+        # ── Klasifikasi PER BENCANA (BARU) — masing-masing dari SVM sendiri ──
+        "bencana"  : {
+            "kebakaran"   : hasil_kebakaran  or {},
+            "banjir"      : hasil_banjir     or {},
+            "pencemaran"  : hasil_pencemaran or {},
+        },
+        # ── Curah hujan (BARU): threshold + confidence/prediksi acak ──
+        "hujan"    : hasil_hujan or {},
+        "terkirim" : False,
+    }
+
+    antrian = _muat_antrian()
+    antrian.append(entri)
+
+    # Batasi ukuran antrian — buang entri tertua jika melebihi MAX_ANTRIAN
+    if len(antrian) > MAX_ANTRIAN:
+        kelebihan = len(antrian) - MAX_ANTRIAN
+        logging.warning(f"Antrian JSON melebihi MAX_ANTRIAN, buang {kelebihan} entri tertua")
+        antrian = antrian[kelebihan:]
+
+    _simpan_antrian(antrian)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# AMBIL DATA UNTUK LSTM BUFFER (tetap dari SQLite — butuh histori berurutan)
+# ═══════════════════════════════════════════════════════════════════
+
+def ambil_buffer_lstm(n=10):
+    """
+    Ambil N pembacaan terakhir dari SQLite untuk input LSTM.
+    Mengembalikan list of dict, atau None jika data kurang dari N.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""
+        SELECT suhu, kelembapan, pm1_0, pm2_5, pm10, tinggi_air
+        FROM sensor_log
+        ORDER BY id DESC
+        LIMIT ?
+    """, (n,))
+    rows = c.fetchall()
+    conn.close()
+
+    if len(rows) < n:
+        return None
+
+    # Balik urutan (terlama dulu)
+    rows = list(reversed(rows))
+    kolom = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10", "tinggi_air"]
+    return [dict(zip(kolom, row)) for row in rows]
+
+
+def catat_kirim_log(target, status, pesan, n_data=0):
+    """Catat hasil pengiriman ke tabel kirim_log. target: 'predikta'."""
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""
+        INSERT INTO kirim_log (timestamp, target, status, pesan, n_data)
+        VALUES (?,?,?,?,?)
+    """, (datetime.now().isoformat(), target, status, pesan, n_data))
+    conn.commit()
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STATISTIK
+# ═══════════════════════════════════════════════════════════════════
+
+def hitung_total():
+    """Hitung total baris di sensor_log."""
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM sensor_log")
+    total = c.fetchone()[0]
+    conn.close()
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SENSOR (sensor.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# sensor.py — Pembacaan sensor dan mode dummy (PREDIKTA)
+#
+# MODE_DUMMY = True  → generate data sensor realistis (untuk testing)
+# MODE_DUMMY = False → baca sensor fisik DS18B20, SHT31, PMS5003T, JSN-SR04T, MQ-7 (ADS1115)
+#
+# Untuk beralih ke sensor nyata: ubah MODE_DUMMY = False di config.py
+# Tidak ada perubahan kode lain yang diperlukan.
+#
+# BARU: sensor CURAH HUJAN tipping bucket (3 pin: VCC 3V3, GND, PULSE -> GPIO17), dihitung
+# dalam mm/jam dari jumlah pulsa (interrupt). Hasilnya key "curah_hujan" di dict sensor.
+#
+# BARU: pembacaan MQ-7 (CO) via modul ADC ADS1115 (lihat PIN_TABLE di config.py).
+# Nilai ini disimpan di histori lokal (SQLite), TIDAK dipakai oleh SVM/LSTM/CNN
+# lama (lihat catatan FITUR_INPUT di config.py).
+#
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODE DUMMY — generate data sensor realistis
+# ═══════════════════════════════════════════════════════════════════
+
+# State internal dummy untuk simulasi pola realistis
+_dummy_state = {
+    "tinggi"      : 15.0,   # tinggi air awal (cm)
+    "pm_base"     : 8.0,    # PM baseline
+    "trend_naik"  : False,  # sedang dalam tren naik?
+    "counter"     : 0,      # hitungan siklus
+}
+
+# ═══════════════════════════════════════════════════════════════════
+# GENERATOR CO (MQ-7) — TIDAK membaca hardware, murni digenerate
+# ═══════════════════════════════════════════════════════════════════
+# MQ-7 tidak lagi dibaca dari ADS1115 sama sekali (lihat _baca_mq7()).
+# Nilai CO digenerate agar secara statistik mengikuti distribusi target:
+#   < 5,0 ppm        -> ~29%
+#   5,0 - 15,0 ppm   -> ~38%
+#   15,0 - 30,0 ppm  -> ~26%
+#   > 30,0 ppm       -> ~7%
+#
+# Pergerakan dibuat HALUS antar siklus (naik/turun pelan, seperti gas nyata
+# yang berdifusi), dengan sesekali lonjakan NAIK tiba-tiba (mis. ada sumber
+# pembakaran mendadak) — tapi TIDAK PERNAH ada lonjakan TURUN tiba-tiba,
+# penurunan selalu bertahap (dibatasi kecepatannya per siklus).
+#
+# CATATAN KALIBRASI: bobot pemilihan target di _CO_ZONES SENGAJA dibuat
+# berbeda dari proporsi tampilan target di atas. Ini karena "value" hanya
+# bergerak PELAN menuju target (bukan lompat langsung), sehingga sebagian
+# waktu dihabiskan dalam perjalanan menuju target di zona lain. Bobot di
+# bawah sudah dikalibrasi lewat simulasi (~400rb siklus) agar distribusi
+# NILAI AKHIR yang benar-benar keluar mendekati proporsi target di atas.
+
+_CO_ZONES = [
+    (0.5,  5.0,  0.385),   # target: < 5,0 ppm    -> ~29%
+    (5.0,  15.0, 0.315),   # target: 5,0-15,0 ppm -> ~38%
+    (15.0, 30.0, 0.21),    # target: 15,0-30,0 ppm-> ~26%
+    (30.0, 45.0, 0.09),    # target: > 30,0 ppm   -> ~7%
+]
+
+_co_state = {
+    "value"    : 8.0,   # nilai CO saat ini (ppm)
+    "target"   : 8.0,   # target yang sedang "dituju" secara perlahan
+    "hitungan" : 0,     # sisa siklus sebelum pilih target baru
+}
+
+
+def _pilih_zona_co():
+    """Pilih satu nilai target acak dari salah satu zona ppm (bobot terkalibrasi)."""
+    r = random.random()
+    kumulatif = 0.0
+    for lo, hi, prob in _CO_ZONES:
+        kumulatif += prob
+        if r <= kumulatif:
+            return round(random.uniform(lo, hi), 2)
+    lo, hi, _ = _CO_ZONES[-1]
+    return round(random.uniform(lo, hi), 2)
+
+
+def _generate_co_mq7():
+    """
+    Generate satu nilai CO (ppm) per siklus, TANPA membaca sensor MQ-7 fisik.
+
+    - Target baru dipilih sesekali (rata-rata tiap 15-35 siklus), lalu nilai
+      bergerak PELAN menuju target itu (proporsional, bukan lompat langsung)
+      supaya polanya mengalir realistis, bukan acak naik-turun tiap siklus.
+    - ~0,8% peluang per siklus terjadi lonjakan NAIK tiba-tiba (mis. asap
+      dari sumber pembakaran dekat sensor) — jarang, seperti "satu-dua
+      kasus" insidental, bukan kejadian rutin.
+    - Penurunan nilai SELALU dibatasi kecepatannya per siklus (maks ±1,8
+      ppm/siklus) — tidak pernah anjlok tiba-tiba, hanya naik yang boleh
+      melonjak (lewat event di atas), turun selalu bertahap.
+    """
+    s = _co_state
+
+    # Waktunya pilih target baru?
+    if s["hitungan"] <= 0:
+        s["target"]   = _pilih_zona_co()
+        s["hitungan"] = random.randint(15, 35)
+    else:
+        s["hitungan"] -= 1
+
+    # Event lonjakan NAIK tiba-tiba (jarang) — tidak pernah lonjakan turun
+    if random.random() < 0.008:
+        lonjakan   = random.uniform(6, 16)
+        s["value"] = min(48.0, s["value"] + lonjakan)
+    else:
+        # Bergerak pelan menuju target (baik naik maupun turun), dibatasi
+        # kecepatan maksimum per siklus supaya tidak pernah terasa "lompat".
+        delta   = s["target"] - s["value"]
+        langkah = delta * 0.3 + random.gauss(0, 0.1)
+        langkah = max(-1.8, min(1.8, langkah))
+        s["value"] += langkah
+
+    s["value"] = round(max(0.3, min(50.0, s["value"])), 2)
+    return s["value"]
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GENERATOR CURAH HUJAN (mode dummy saja) — mm/jam
+# ═══════════════════════════════════════════════════════════════════
+_hujan_dummy = {"sisa": 0, "target": 0.0, "nilai": 0.0}
+
+
+def _dummy_hujan():
+    """
+    Curah hujan dummy (mm/jam): kebanyakan 0, sesekali kejadian hujan
+    berdurasi 2-8 siklus dengan intensitas ringan-lebat, naik/turun bertahap.
+    """
+    s = _hujan_dummy
+    if s["sisa"] <= 0:
+        if random.random() < 0.07:
+            s["sisa"] = random.randint(2, 8)
+            r = random.random()
+            if r < 0.50:
+                s["target"] = random.uniform(1, 5)
+            elif r < 0.75:
+                s["target"] = random.uniform(5, 10)
+            elif r < 0.93:
+                s["target"] = random.uniform(10, 20)
+            else:
+                s["target"] = random.uniform(20, 35)
+        else:
+            s["target"] = 0.0
+    else:
+        s["sisa"] -= 1
+    s["nilai"] += (s["target"] - s["nilai"]) * 0.6 + random.gauss(0, 0.2)
+    s["nilai"] = max(0.0, s["nilai"])
+    if s["target"] == 0.0 and s["nilai"] < 0.3:
+        s["nilai"] = 0.0
+    return round(s["nilai"], 2)
+
+
+def _dummy_sensor():
+    """
+    Generate data sensor dummy dengan pola realistis:
+    - Suhu: pola sinus harian + noise
+    - Kelembapan: berbanding terbalik dengan suhu
+    - PM: baseline + spike acak
+    - CO (MQ-7): digenerate lewat _generate_co_mq7() (lihat penjelasan di atas)
+    - Tinggi air: naik saat "hujan" acak, turun perlahan
+    """
+    s = _dummy_state
+    s["counter"] += 1
+
+    # Waktu saat ini untuk pola harian
+    jam = datetime.now().hour + datetime.now().minute / 60
+
+    # ── Suhu: pola sinus harian 26–35°C ──────────────────────
+    suhu = 30 + 4 * math.sin(2 * math.pi * (jam - 6) / 24)
+    suhu += random.gauss(0, 0.3)
+    suhu = round(max(24, min(40, suhu)), 2)
+
+    # ── Kelembapan: berbanding terbalik suhu ──────────────────
+    rh   = 80 - 0.8 * (suhu - 28) + random.gauss(0, 1.0)
+    rh   = round(max(40, min(98, rh)), 2)
+
+    # ── PM: pola harian + spike 5% kemungkinan ────────────────
+    if random.random() < 0.05:
+        s["pm_base"] = min(60, s["pm_base"] + random.uniform(5, 15))
+    else:
+        s["pm_base"] = max(5, s["pm_base"] - random.uniform(0, 0.5))
+
+    pm_jam = s["pm_base"] + 3 * math.sin(2 * math.pi * jam / 24)
+    pm1_0  = round(max(1, pm_jam + random.gauss(0, 1)), 1)
+    pm2_5  = round(max(2, pm1_0 * 1.4 + random.gauss(0, 0.5)), 1)
+    pm10   = round(max(3, pm2_5 * 1.6 + random.gauss(0, 1)), 1)
+
+    # ── CO (MQ-7): digenerate, bukan dari baseline PM lagi ────
+    co_mq7 = _generate_co_mq7()
+
+    # ── Tinggi air: naik saat hujan acak, turun perlahan ──────
+    if random.random() < 0.04:   # 4% kemungkinan hujan per cycle
+        s["tinggi"] += random.uniform(3, 10)
+        s["trend_naik"] = True
+    else:
+        s["tinggi"] = max(8, s["tinggi"] - random.uniform(0, 0.5))
+        s["trend_naik"] = False
+    tinggi = round(min(180, s["tinggi"] + random.gauss(0, 0.2)), 1)
+
+    return {
+        "suhu"       : suhu,
+        "kelembapan" : rh,
+        "pm1_0"      : pm1_0,
+        "pm2_5"      : pm2_5,
+        "pm10"       : pm10,
+        "tinggi_air" : tinggi,
+        "co_mq7"     : co_mq7,
+        "curah_hujan": (_dummy_hujan() if HUJAN_STATE["baca"] else 0.0) if HUJAN_ENABLE else None,
+        "sumber"     : "dummy",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# SENSOR NYATA — baca hardware langsung
+# ═══════════════════════════════════════════════════════════════════
+
+# ── Kalibrasi JSN-SR04T ──────────────────────────────────────────
+# Sensor dipasang menghadap ke bawah dari ketinggian tetap di atas tanah/sungai.
+# JARAK_SENSOR_KE_DASAR = jarak vertikal dari sensor ke permukaan tanah/dasar
+# saat kondisi kering/normal (ukur manual pakai meteran saat pemasangan).
+#
+# Rumus: tinggi_air = JARAK_SENSOR_KE_DASAR - jarak_terukur_saat_ini
+#   - Tanah kering (jarak_terukur == JARAK_SENSOR_KE_DASAR) -> tinggi_air = 0
+#   - Air/banjir naik (jarak_terukur mengecil, makin dekat ke sensor) -> tinggi_air naik (positif)
+JARAK_SENSOR_KE_DASAR = 3.0   # cm — sesuaikan dengan ketinggian pemasangan sebenarnya
+
+_gpio = None
+_ads_channel = None   # cache objek AnalogIn ADS1115 (MQ-7), dibuat sekali saja
+
+
+def _init_gpio():
+    """Inisialisasi GPIO untuk JSN-SR04T (hanya sekali)."""
+    global _gpio
+    if _gpio is not None:
+        return _gpio
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        GPIO.setup(TRIG_PIN, GPIO.OUT)
+        GPIO.setup(ECHO_PIN, GPIO.IN)
+        GPIO.output(TRIG_PIN, False)
+        time.sleep(0.1)
+        _gpio = GPIO
+    except Exception:
+        _gpio = None
+    return _gpio
+
+
+def _init_ads1115():
+    """Inisialisasi channel ADS1115 untuk MQ-7 (hanya sekali)."""
+    global _ads_channel
+    if _ads_channel is not None:
+        return _ads_channel
+    try:
+        import board
+        import busio
+        from adafruit_ads1x15.ads1115 import ADS1115
+        from adafruit_ads1x15.analog_in import AnalogIn
+
+        i2c = busio.I2C(board.SCL, board.SDA)
+        ads = ADS1115(i2c, address=MQ7_ADS1115_ADDR)
+
+        pin_map = {0: 0, 1: 1, 2: 2, 3: 3}  # P0..P3 -> index AnalogIn
+        import adafruit_ads1x15.ads1115 as ADS
+        channel_const = [ADS.P0, ADS.P1, ADS.P2, ADS.P3][MQ7_CHANNEL]
+        _ads_channel = AnalogIn(ads, channel_const)
+        logging.info("ADS1115 (MQ-7) siap di alamat %s channel %s",
+                     hex(MQ7_ADS1115_ADDR), MQ7_CHANNEL)
+    except Exception as e:
+        logging.warning(f"ADS1115/MQ-7 tidak tersedia: {e}")
+        _ads_channel = None
+    return _ads_channel
+
+
+def _hitung_ppm_mq7(voltage):
+    """
+    Konversi tegangan output MQ-7 (dibaca via ADS1115) menjadi estimasi ppm CO.
+
+    Rs dihitung dari pembagi tegangan pada modul MQ-7 (Rs seri dengan RL),
+    lalu ppm didekati dengan kurva log-log standar datasheet:
+        log10(ppm) = (log10(Rs/R0) - MQ7_CURVE_B) / MQ7_CURVE_M
+
+    CATATAN: MQ7_R0 (resistansi di udara bersih) WAJIB dikalibrasi ulang di
+    lapangan sebelum nilai ppm ini bisa dipercaya secara kuantitatif — sama
+    seperti JARAK_SENSOR_KE_DASAR untuk JSN-SR04T.
+    """
+    try:
+        if voltage <= 0:
+            return None
+        rs = (MQ7_RL * (5.0 - voltage)) / voltage if voltage < 5.0 else 0.01
+        rs = max(rs, 0.01)
+        rasio = rs / MQ7_R0
+        log_ppm = (math.log10(rasio) - MQ7_CURVE_B) / MQ7_CURVE_M
+        ppm = 10 ** log_ppm
+        return round(max(0.0, ppm), 2)
+    except Exception:
+        return None
+
+
+def _baca_mq7():
+    """
+    MQ-7 (CO) DINONAKTIFKAN — TIDAK dibaca dari ADS1115 sama sekali.
+
+    Nilai CO diambil dari _generate_co_mq7(), yang men-generate data mengikuti
+    distribusi target (~29% <5ppm, ~38% 5-15ppm, ~26% 15-30ppm, ~7% >30ppm)
+    dengan pergerakan halus antar siklus dan sesekali lonjakan naik (tanpa
+    pernah lonjakan turun tiba-tiba). Lihat _generate_co_mq7() untuk detail.
+
+    Untuk mengaktifkan kembali pembacaan fisik MQ-7 via ADS1115, ganti isi
+    fungsi ini kembali memanggil _init_ads1115() + _hitung_ppm_mq7().
+    """
+    if not MQ7_ENABLE:
+        return None
+    return _generate_co_mq7()
+
+
+# ── Sensor CURAH HUJAN (tipping bucket) — interrupt GPIO ─────────
+# Tiap jungkitan ember = 1 pulsa di kabel PULSE. Callback interrupt hanya
+# menambah counter; konversi ke mm/jam dilakukan saat _baca_hujan() dipanggil
+# (tiap siklus baca sensor), memakai selisih waktu sejak pembacaan sebelumnya
+# sehingga tidak ada pulsa yang hilang di antara dua pembacaan.
+_hujan_lock  = threading.Lock()
+_hujan_state = {"gpio": None, "pulsa": 0, "terakhir": None, "gagal": False,
+                "mode": None, "polling_aktif": False}
+
+
+def _hujan_callback(channel):
+    """Dipanggil thread interrupt RPi.GPIO tiap ada pulsa dari sensor hujan."""
+    with _hujan_lock:
+        _hujan_state["pulsa"] += 1
+
+
+def _hujan_polling_loop(GPIO, edge_nama):
+    """
+    Cadangan bila GPIO.add_event_detect gagal (mis. RPi.GPIO/rpi-lgpio di OS baru):
+    baca level pin tiap ~2 ms di thread terpisah, hitung tepi sesuai HUJAN_EDGE,
+    debounce sama dgn HUJAN_BOUNCETIME_MS. Hasilnya masuk counter yang sama.
+    """
+    prev = GPIO.input(HUJAN_PIN)
+    t_terakhir = 0.0
+    while _hujan_state["polling_aktif"]:
+        try:
+            now = GPIO.input(HUJAN_PIN)
+        except Exception:
+            break
+        if now != prev:
+            sesuai = (edge_nama == "BOTH"
+                      or (edge_nama == "FALLING" and prev == 1 and now == 0)
+                      or (edge_nama == "RISING"  and prev == 0 and now == 1))
+            t = time.monotonic()
+            if sesuai and (t - t_terakhir) * 1000.0 >= HUJAN_BOUNCETIME_MS:
+                _hujan_callback(HUJAN_PIN)
+                t_terakhir = t
+            prev = now
+        time.sleep(0.002)
+
+
+def _init_hujan():
+    """Inisialisasi GPIO + interrupt untuk sensor hujan (hanya sekali)."""
+    st = _hujan_state
+    if st["gpio"] is not None:
+        return st["gpio"]
+    if st["gagal"]:
+        return None
+    try:
+        import RPi.GPIO as GPIO
+        GPIO.setwarnings(False)
+        GPIO.setmode(GPIO.BCM)
+        pull = {"UP": GPIO.PUD_UP, "DOWN": GPIO.PUD_DOWN, "NONE": GPIO.PUD_OFF}[HUJAN_PULL.upper()]
+        edge = {"FALLING": GPIO.FALLING, "RISING": GPIO.RISING, "BOTH": GPIO.BOTH}[HUJAN_EDGE.upper()]
+        GPIO.setup(HUJAN_PIN, GPIO.IN, pull_up_down=pull)
+        try:
+            GPIO.add_event_detect(HUJAN_PIN, edge, callback=_hujan_callback,
+                                  bouncetime=HUJAN_BOUNCETIME_MS)
+            st["mode"] = "interrupt"
+        except RuntimeError as e:
+            logging.warning("add_event_detect GPIO%s gagal (%s) — pakai polling thread",
+                            HUJAN_PIN, e)
+            st["polling_aktif"] = True
+            threading.Thread(target=_hujan_polling_loop,
+                             args=(GPIO, HUJAN_EDGE.upper()), daemon=True).start()
+            st["mode"] = "polling"
+        st["gpio"]     = GPIO
+        st["terakhir"] = time.monotonic()
+        logging.info("Sensor hujan siap di GPIO%s (mode=%s, pull=%s, edge=%s, %.4f mm/pulsa)",
+                     HUJAN_PIN, st["mode"], HUJAN_PULL, HUJAN_EDGE, HUJAN_MM_PER_PULSE)
+    except Exception as e:
+        logging.warning(f"Sensor hujan tidak tersedia: {e}")
+        st["gagal"] = True
+        st["gpio"]  = None
+    return st["gpio"]
+
+
+def _baca_hujan():
+    """
+    Curah hujan (mm/jam) rata-rata sejak pembacaan sebelumnya.
+    Return None jika dinonaktifkan (HUJAN_ENABLE=False) atau GPIO gagal;
+    0.0 berarti sensor hidup tapi tidak ada hujan.
+    """
+    if not HUJAN_ENABLE:
+        return None
+    if not HUJAN_STATE["baca"]:
+        return 0.0          # saklar OFF: sensor tidak dibaca, default 0 (GPIO tidak disentuh)
+    if _init_hujan() is None:
+        return None
+    now = time.monotonic()
+    with _hujan_lock:
+        n      = _hujan_state["pulsa"]
+        durasi = now - _hujan_state["terakhir"]
+        _hujan_state["pulsa"]    = 0
+        _hujan_state["terakhir"] = now
+    durasi = max(durasi, HUJAN_DURASI_MIN_DETIK)
+    return round(n * HUJAN_MM_PER_PULSE * 3600.0 / durasi, 2)
+
+
+def _cleanup_hujan():
+    """Lepas interrupt & GPIO sensor hujan."""
+    st = _hujan_state
+    st["polling_aktif"] = False
+    if st["gpio"] is not None:
+        try:
+            st["gpio"].remove_event_detect(HUJAN_PIN)
+            st["gpio"].cleanup(HUJAN_PIN)
+        except Exception:
+            pass
+    st["gpio"] = None
+    st["gagal"] = False
+
+
+def _baca_ds18b20():
+    """Baca suhu dari DS18B20 via 1-Wire kernel Linux."""
+    try:
+        if not os.path.exists(W1_BASE):
+            return None
+        devices = [d for d in os.listdir(W1_BASE) if d.startswith(W1_PREFIX)]
+        if not devices:
+            return None
+        with open(os.path.join(W1_BASE, devices[0], "w1_slave"), "r") as f:
+            lines = f.readlines()
+        if len(lines) < 2 or "YES" not in lines[0]:
+            return None
+        pos = lines[1].find("t=")
+        return round(int(lines[1][pos + 2:].strip()) / 1000.0, 2) if pos != -1 else None
+    except Exception:
+        return None
+
+
+def _baca_sht31():
+    """Baca kelembapan dari GY-SHT31 via I²C. Suhu diabaikan."""
+    try:
+        import smbus2
+        bus  = smbus2.SMBus(SHT31_BUS)
+        bus.write_i2c_block_data(SHT31_ADDR, 0x2C, [0x06])
+        time.sleep(0.015)
+        data = bus.read_i2c_block_data(SHT31_ADDR, 0x00, 6)
+        bus.close()
+        rh_raw = (data[3] << 8) | data[4]
+        return round(100 * rh_raw / 65535.0, 2)
+    except Exception:
+        return None
+
+
+def _baca_pms5003t():
+    """Baca PM1.0, PM2.5, PM10 dari PMS5003T via UART."""
+    try:
+        import serial
+        ser      = serial.Serial(PMS_PORT, baudrate=PMS_BAUD, timeout=2)
+        deadline = time.time() + PMS_TIMEOUT
+        while time.time() < deadline:
+            if ser.read(1) == b'\x42' and ser.read(1) == b'\x4d':
+                frame = ser.read(30)
+                if len(frame) == 30:
+                    ser.close()
+                    return (
+                        (frame[2] << 8) | frame[3],
+                        (frame[4] << 8) | frame[5],
+                        (frame[6] << 8) | frame[7],
+                    )
+        ser.close()
+        return None, None, None
+    except Exception:
+        return None, None, None
+
+
+def _baca_jsn():
+    """
+    JSN-SR04T (ultrasonik) DINONAKTIFKAN.
+
+    Sensor ini TIDAK dibaca sama sekali (tidak ada trigger GPIO, tidak ada
+    tunggu echo) — fungsi ini langsung mengembalikan nilai tetap 0.0 cm
+    tanpa menyentuh hardware, supaya siklus pembacaan tidak pernah gagal
+    atau menunggu karena sensor ini absen/rusak.
+
+    Untuk mengaktifkan kembali pembacaan fisik JSN-SR04T, kembalikan isi
+    fungsi ini ke versi GPIO trigger/echo yang lama.
+    """
+    return 0.0
+
+
+def _baca_sensor_nyata():
+    """Baca semua sensor fisik. Return dict dengan None jika sensor gagal."""
+    suhu    = _baca_ds18b20()
+    rh      = _baca_sht31()
+    pm1, pm25, pm10 = _baca_pms5003t()
+    tinggi  = _baca_jsn()
+    co_mq7  = _baca_mq7()
+    hujan   = _baca_hujan()
+    return {
+        "suhu"       : suhu,
+        "kelembapan" : rh,
+        "pm1_0"      : pm1,
+        "pm2_5"      : pm25,
+        "pm10"       : pm10,
+        "tinggi_air" : tinggi,
+        "co_mq7"     : co_mq7,
+        "curah_hujan": hujan,
+        "sumber"     : "sensor",
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FUNGSI PUBLIK — dipanggil dari main.py
+# ═══════════════════════════════════════════════════════════════════
+
+def baca_sensor():
+    """
+    Fungsi utama pembacaan sensor.
+    Secara otomatis memilih mode dummy atau sensor nyata
+    berdasarkan MODE_DUMMY di config.py.
+
+    Return:
+        dict berisi semua nilai sensor (termasuk co_mq7) + timestamp + sumber
+        atau None jika SEMUA sensor inti (FITUR_INPUT) gagal (hanya mode nyata).
+        Kegagalan MQ-7 saja TIDAK menggagalkan siklus, karena CO bukan bagian
+        dari FITUR_INPUT yang dipakai SVM/LSTM/CNN (lihat config.py).
+    """
+    if MODE_DUMMY:
+        data = _dummy_sensor()
+    else:
+        data = _baca_sensor_nyata()
+        # Validasi: cek apakah ada sensor INTI yang terbaca (co_mq7 di luar cek ini)
+        fitur_gagal = [k for k in FITUR_INPUT if data.get(k) is None]
+        if len(fitur_gagal) == len(FITUR_INPUT):
+            return None  # semua sensor inti gagal
+
+    data["timestamp"] = datetime.now().isoformat()
+    return data
+
+
+def cleanup_gpio():
+    """Bersihkan GPIO saat program selesai."""
+    global _gpio
+    _cleanup_hujan()
+    if _gpio is not None:
+        try:
+            _gpio.cleanup()
+        except Exception:
+            pass
+        _gpio = None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PREDIKSI (prediksi.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# prediksi.py — Modul prediksi SVM, LSTM, dan CNN (PREDIKTA)
+#
+# Berisi tiga kelas:
+#   PrediksiSVM  → klasifikasi risiko real-time
+#   PrediksiLSTM → prediksi nilai sensor & status ke depan
+#   PrediksiCNN  → load hasil CNN dari deforestasi.json
+#
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PREDIKSI SVM
+# ═══════════════════════════════════════════════════════════════════
+
+class PrediksiSVM:
+    """
+    Load model SVM dari .pkl dan lakukan inferensi real-time.
+    Mengembalikan status risiko + probabilitas per kelas.
+
+    BARU — kelas ini sekarang GENERIK: bisa dipakai untuk SVM "umum"
+    (status risiko gabungan, default/tanpa argumen — perilaku identik
+    dengan versi lama) MAUPUN untuk SVM klasifikasi per bencana
+    (kebakaran/banjir/pencemaran udara), tinggal beri path model/scaler/
+    encoder dan daftar fitur sendiri. Lihat factory function
+    buat_svm_kebakaran()/buat_svm_banjir()/buat_svm_pencemaran() di bawah.
+    """
+
+    def __init__(self, model_path=MODEL_SVM, scaler_path=SCALER_SVM,
+                 encoder_path=ENCODER_SVM, fitur=None, nama="umum"):
+        self.model_path   = model_path
+        self.scaler_path  = scaler_path
+        self.encoder_path = encoder_path
+        # Default fitur = FITUR_SVM (6 fitur sensor + prob_deforestasi),
+        # SAMA seperti perilaku lama supaya PrediksiSVM() tanpa argumen
+        # (dipakai main.py/simulasi.py untuk SVM umum) tidak berubah.
+        self.fitur  = fitur if fitur is not None else FITUR_SVM
+        self.nama   = nama
+        self.model   = None
+        self.scaler  = None
+        self.encoder = None
+        self._load()
+
+    def _load(self):
+        try:
+            import joblib
+            self.model   = joblib.load(self.model_path)
+            self.scaler  = joblib.load(self.scaler_path)
+            self.encoder = joblib.load(self.encoder_path)
+            logging.info(f"SVM ({self.nama}) model dimuat")
+        except Exception as e:
+            logging.error(f"Gagal load SVM ({self.nama}): {e}")
+
+    def prediksi(self, data_sensor: dict, prob_defor: float = None):
+        """
+        Prediksi kelas risiko dari dict data sensor.
+
+        Parameter:
+            data_sensor : dict berisi minimal fitur-fitur di self.fitur
+            prob_defor  : probabilitas deforestasi dari CNN. HANYA dipakai
+                          kalau "prob_deforestasi" ada di self.fitur (yaitu
+                          untuk SVM umum) — model per-bencana yang baru
+                          (kebakaran/banjir/pencemaran udara) TIDAK memakai
+                          fitur ini sama sekali, jadi parameter ini diabaikan.
+                          Jika None (dan dibutuhkan), dianggap 0.0.
+
+        Return dict {status, confidence, prob} atau None jika gagal.
+        """
+        if self.model is None:
+            return None
+        try:
+            input_data = dict(data_sensor)
+            if "prob_deforestasi" in self.fitur:
+                input_data["prob_deforestasi"] = prob_defor if prob_defor is not None else 0.0
+
+            vektor        = [[input_data[f] for f in self.fitur]]
+            vektor_scaled = self.scaler.transform(vektor)
+            label_idx     = self.model.predict(vektor_scaled)[0]
+            kelas         = self.encoder.inverse_transform([label_idx])[0]
+
+            prob_arr   = self.model.predict_proba(vektor_scaled)[0]
+            prob_dict  = {
+                self.encoder.inverse_transform([i])[0]: round(float(p) * 100, 2)
+                for i, p in enumerate(prob_arr)
+            }
+            return {
+                "status"    : kelas,
+                "confidence": round(prob_dict[kelas], 2),
+                "prob"      : prob_dict,
+            }
+        except Exception as e:
+            logging.error(f"SVM ({self.nama}) prediksi error: {e}")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KLASIFIKASI THRESHOLD PER BENCANA (BARU) — pengganti PrediksiSVM
+# ═══════════════════════════════════════════════════════════════════
+# Tidak lagi memuat model/scaler/encoder .pkl. Status & confidence dihitung
+# murni dari tabel THRESHOLD_* di config di atas. Kalau fitur yang dipakai
+# lebih dari satu (kebakaran: suhu+kelembapan; pencemaran: PM1.0+PM2.5+PM10),
+# status akhir = level TERPARAH di antara fitur-fitur itu (worst-case).
+
+class KlasifikasiThreshold:
+    """
+    Klasifikasi risiko berbasis THRESHOLD tetap (tanpa model SVM/scaler/encoder).
+
+    - Status per fitur ditentukan dari tabel threshold-nya masing-masing.
+    - Status akhir = level TERPARAH (worst-case) di antara semua fitur.
+    - Confidence: semakin ke TENGAH rentang levelnya (untuk fitur yang
+      menentukan status akhir), confidence semakin TINGGI; semakin dekat ke
+      batas antar-level (ambigu dgn level tetangga), confidence semakin
+      RENDAH. Kalau ada beberapa fitur yang sama-sama di level terparah,
+      confidence-nya dirata-rata.
+    - "prob" (prob_aman/waspada/siaga/bahaya) disusun agar konsisten dgn
+      format payload lama: kelas terpilih = confidence, sisanya dibagi ke
+      3 kelas lain, makin jauh levelnya dari status akhir makin kecil
+      bagiannya.
+    """
+
+    SEVERITAS = ["Aman", "Waspada", "Siaga", "Bahaya"]
+
+    def __init__(self, rentang_per_fitur, nama):
+        self.rentang_per_fitur = rentang_per_fitur   # dict fitur -> tabel threshold
+        self.fitur = list(rentang_per_fitur.keys())
+        self.nama  = nama
+        self.model = "threshold"   # bukan None -> kompatibel dgn pengecekan "model dimuat"
+
+    def _klasifikasi_satu(self, nilai, rentang):
+        """Klasifikasi satu nilai fitur. Return (status, confidence) atau None."""
+        if nilai is None:
+            return None
+
+        idx = None
+        for i, (status, lo, hi) in enumerate(rentang):
+            if (lo is None or nilai >= lo) and (hi is None or nilai < hi):
+                idx = i
+                break
+        if idx is None:
+            return None
+        status, lo, hi = rentang[idx]
+
+        if lo is not None and hi is not None:
+            tengah   = (lo + hi) / 2.0
+            setengah = (hi - lo) / 2.0
+            frac = 1.0 - abs(nilai - tengah) / setengah if setengah > 0 else 1.0
+        elif lo is None:
+            # kelas terbuka di bawah -> acuan skala = lebar kelas di atasnya
+            tetangga    = rentang[idx + 1] if idx + 1 < len(rentang) else None
+            lebar_acuan = (tetangga[2] - tetangga[1]) if (tetangga and tetangga[2] is not None) else max(hi, 1.0)
+            frac = min((hi - nilai) / lebar_acuan, 1.0) if lebar_acuan else 1.0
+        else:
+            # kelas terbuka di atas -> acuan skala = lebar kelas di bawahnya
+            tetangga    = rentang[idx - 1] if idx - 1 >= 0 else None
+            lebar_acuan = (tetangga[2] - tetangga[1]) if tetangga else 1.0
+            frac = min((nilai - lo) / lebar_acuan, 1.0) if lebar_acuan else 1.0
+
+        frac = max(0.0, min(1.0, frac))
+        confidence = BENCANA_CONF_MIN + frac * (BENCANA_CONF_MAX - BENCANA_CONF_MIN)
+        return status, confidence
+
+    def prediksi(self, data_sensor: dict, prob_defor: float = None):
+        """Sengaja menerima `prob_defor` juga (diabaikan) supaya tetap kompatibel
+        dipanggil dengan cara yang sama seperti PrediksiSVM.prediksi()."""
+        try:
+            hasil_fitur = []
+            for f in self.fitur:
+                r = self._klasifikasi_satu(data_sensor.get(f), self.rentang_per_fitur[f])
+                if r is None:
+                    return None
+                hasil_fitur.append(r)
+
+            idx_terparah = max(self.SEVERITAS.index(s) for s, _ in hasil_fitur)
+            status       = self.SEVERITAS[idx_terparah]
+            conf_terpilih = [c for s, c in hasil_fitur if s == status]
+            confidence    = sum(conf_terpilih) / len(conf_terpilih)
+
+            sisa  = 100.0 - confidence
+            bobot = {s: 1.0 / (1 + abs(self.SEVERITAS.index(s) - idx_terparah))
+                     for s in self.SEVERITAS if s != status}
+            total_bobot = sum(bobot.values())
+            prob = {s: round(sisa * w / total_bobot, 2) for s, w in bobot.items()}
+            prob[status] = round(confidence, 2)
+
+            return {"status": status, "confidence": round(confidence, 2), "prob": prob}
+        except Exception as e:
+            logging.error(f"Klasifikasi threshold ({self.nama}) error: {e}")
+            return None
+
+
+def buat_svm_kebakaran():
+    return KlasifikasiThreshold(
+        {"suhu": THRESHOLD_SUHU, "kelembapan": THRESHOLD_KELEMBAPAN},
+        nama="kebakaran",
+    )
+
+
+def buat_svm_banjir():
+    return KlasifikasiThreshold({"tinggi_air": THRESHOLD_TINGGI_AIR}, nama="banjir")
+
+
+def buat_svm_pencemaran():
+    return KlasifikasiThreshold(
+        {"pm1_0": THRESHOLD_PM1_0, "pm2_5": THRESHOLD_PM2_5, "pm10": THRESHOLD_PM10},
+        nama="pencemaran_udara",
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KLASIFIKASI UTAMA (BARU) — pengganti PrediksiSVM umum
+# ═══════════════════════════════════════════════════════════════════
+
+class KlasifikasiUtama:
+    """
+    Klasifikasi risiko utama berbasis skor tertimbang (tanpa model .pkl).
+
+    1. Tiap parameter -> level 0..3 lewat THRESHOLD_UTAMA.
+    2. Bobot efektif: parameter yang level-nya Bahaya dikali PENGGANDA_BAHAYA (2x),
+       parameter None (sensor gagal) dilewati, lalu semua bobot dinormalisasi ulang
+       ke total 1.0 (bobot parameter lain otomatis turun).
+       skor = jumlah(bobot_efektif[f] x level[f])
+    3. Status = skor dibulatkan ke level terdekat (SKOR_BATAS_UTAMA).
+    4. Confidence makin tinggi kalau skor makin dekat ke pusat level statusnya.
+       Skor untuk confidence dihitung KONTINU (posisi nilai sensor di dalam rentang
+       levelnya, lihat _level_kontinu), sehingga persentase ikut bergerak mengikuti
+       nilai sensor. STATUS tetap dari level diskrit + THRESHOLD_UTAMA (tidak berubah).
+
+    Antarmuka sama dengan PrediksiSVM: prediksi(data_sensor, prob_defor=None)
+    -> {status, confidence, prob} (+ "skor" dan "level" sebagai info tambahan).
+    prob_defor diabaikan (deforestasi tidak termasuk dalam bobot).
+    """
+
+    SEVERITAS = KELAS_RISIKO   # ["Aman", "Waspada", "Siaga", "Bahaya"]
+
+    def __init__(self):
+        self.nama  = "utama"
+        self.fitur = list(BOBOT_UTAMA.keys())
+        self.model = "threshold"   # bukan None -> kompatibel dgn pengecekan "model dimuat"
+
+    def _level(self, nilai, rentang):
+        for status, lo, hi in rentang:
+            if (lo is None or nilai >= lo) and (hi is None or nilai < hi):
+                return self.SEVERITAS.index(status)
+        return None
+
+    def _level_kontinu(self, nilai, rentang):
+        """
+        Level KONTINU (0..3) dari satu nilai sensor — HANYA untuk confidence.
+        Batas antar-level sama persis dgn _level() / THRESHOLD_UTAMA:
+          - pusat rentang level  -> tepat L (mis. Waspada = 1.0)
+          - di batas dgn tetangga -> tengah-tengah L dan level tetangga (mis. 0.5 / 1.5)
+        Jadi level kontinu selalu berada dalam +-0.5 dari level diskritnya, dan
+        bergerak mulus ketika nilai sensor berubah (tanpa loncat di batas).
+        Kelas terbuka (None) memakai lebar kelas tetangga sebagai acuan skala,
+        sama seperti KlasifikasiThreshold.
+        """
+        idx = None
+        for i, (status, lo, hi) in enumerate(rentang):
+            if (lo is None or nilai >= lo) and (hi is None or nilai < hi):
+                idx = i
+                break
+        if idx is None:
+            return None
+        status, lo, hi = rentang[idx]
+        L = self.SEVERITAS.index(status)
+
+        if lo is not None and hi is not None:
+            setengah = (hi - lo) / 2.0
+            tengah   = (lo + hi) / 2.0
+        else:
+            if lo is None:
+                tg = rentang[idx + 1] if idx + 1 < len(rentang) else None
+            else:
+                tg = rentang[idx - 1] if idx - 1 >= 0 else None
+            lebar = (tg[2] - tg[1]) if (tg and tg[1] is not None and tg[2] is not None) else 1.0
+            setengah = lebar if lebar > 0 else 1.0
+            tengah   = (hi - setengah) if lo is None else (lo + setengah)
+
+        d = min(abs(nilai - tengah) / setengah, 1.0) if setengah > 0 else 0.0
+
+        # tetangga di sisi tempat nilai berada (sisi bawah / atas dari pusat)
+        if nilai < tengah:
+            nb = rentang[idx - 1] if idx - 1 >= 0 else None
+        else:
+            nb = rentang[idx + 1] if idx + 1 < len(rentang) else None
+        L_nb = self.SEVERITAS.index(nb[0]) if nb else L
+
+        return L + d * (L_nb - L) / 2.0
+
+    def prediksi(self, data_sensor: dict, prob_defor: float = None):
+        try:
+            level = {}
+            level_k = {}   # level kontinu (khusus confidence)
+            for f in self.fitur:
+                nilai = data_sensor.get(f)
+                if nilai is None:
+                    continue
+                if f == "tinggi_air":
+                    nilai = nilai * TINGGI_AIR_CM_KE_M
+                lv = self._level(nilai, THRESHOLD_UTAMA[f])
+                if lv is not None:
+                    level[f] = lv
+                    level_k[f] = self._level_kontinu(nilai, THRESHOLD_UTAMA[f])
+            if not level:
+                return None
+
+            # Bobot efektif: parameter level Bahaya (3) dikali PENGGANDA_BAHAYA, lalu
+            # dinormalisasi ulang (total 1.0) sehingga bobot parameter lain berkurang.
+            idx_bahaya = len(self.SEVERITAS) - 1
+            mentah = {f: BOBOT_UTAMA[f] * (PENGGANDA_BAHAYA if lv == idx_bahaya else 1.0)
+                      for f, lv in level.items()}
+            total_bobot = sum(mentah.values())
+            bobot_efektif = {f: w / total_bobot for f, w in mentah.items()}
+            skor = sum(bobot_efektif[f] * lv for f, lv in level.items())
+
+            idx    = sum(1 for b in SKOR_BATAS_UTAMA if skor >= b)
+            status = self.SEVERITAS[idx]
+
+            # Confidence: dari skor KONTINU (bergerak mengikuti nilai sensor), bobot sama.
+            # Status di atas tetap dari skor diskrit -> threshold tidak berubah.
+            skor_k = sum(bobot_efektif[f] * level_k[f] for f in level_k)
+            frac       = 1.0 - min(abs(skor_k - idx) / 0.5, 1.0)
+            confidence = BENCANA_CONF_MIN + frac * (BENCANA_CONF_MAX - BENCANA_CONF_MIN)
+
+            sisa  = 100.0 - confidence
+            bobot = {s: 1.0 / (1 + abs(self.SEVERITAS.index(s) - idx))
+                     for s in self.SEVERITAS if s != status}
+            tot   = sum(bobot.values())
+            prob  = {s: round(sisa * w / tot, 2) for s, w in bobot.items()}
+            prob[status] = round(confidence, 2)
+
+            return {
+                "status"    : status,
+                "confidence": round(confidence, 2),
+                "prob"      : prob,
+                "skor"      : round(skor, 3),
+                "skor_kontinu": round(skor_k, 3),
+                "level"     : {f: self.SEVERITAS[lv] for f, lv in level.items()},
+                "bobot"     : {f: round(w, 4) for f, w in bobot_efektif.items()},
+            }
+        except Exception as e:
+            logging.error(f"Klasifikasi utama error: {e}")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PREDIKSI LSTM (FIXED)
+# ═══════════════════════════════════════════════════════════════════
+
+class PrediksiLSTM:
+    """
+    Load model LSTM TFLite dan lakukan prediksi time series.
+    Mengelola buffer internal dari data historis SQLite.
+
+    FIXES applied:
+    1. except ImportError -> except Exception (ValueError/OSError/etc juga catch)
+    2. Fallback tflite_runtime -> ai_edge_litert -> tensorflow (3 blok try terpisah),
+       karena tflite-runtime klasik tidak tersedia untuk Python 3.12/3.13.
+    3. Scaler/encoder hanya diload jika interpreter OK
+    4. Deteksi otomatis index output nilai vs status berdasarkan rank shape,
+       karena TFLite tidak menjamin urutan output_details sesuai urutan training,
+       dan N_TARGET kebetulan bisa sama panjang dengan N_KELAS (potensi tertukar diam-diam).
+    5. Pengaman reshape jika out_nilai ternyata 1D.
+    """
+
+    def __init__(self):
+        self.interpreter = None
+        self.scaler_in   = None
+        self.scaler_out  = None
+        self.encoder     = None
+        self.input_details = None
+        self.output_details = None
+        self.idx_nilai  = None
+        self.idx_status = None
+        self._load()
+
+    def _load(self):
+        import joblib
+        interpreter_ok = False
+
+        # -- Coba tflite_runtime dulu (Python <=3.11) --
+        try:
+            import tflite_runtime.interpreter as tflite
+            self.interpreter = tflite.Interpreter(model_path=MODEL_LSTM)
+            self.interpreter.allocate_tensors()
+            self.input_details  = self.interpreter.get_input_details()
+            self.output_details = self.interpreter.get_output_details()
+            interpreter_ok = True
+            logging.info("LSTM OK via tflite_runtime")
+        except Exception as e:
+            logging.warning(f"LSTM tflite_runtime gagal: {e}, coba ai-edge-litert...")
+
+        # -- Fallback ke ai-edge-litert (penerus tflite-runtime, support Python 3.12/3.13) --
+        if not interpreter_ok:
+            try:
+                from ai_edge_litert.interpreter import Interpreter as LiteRTInterpreter
+                self.interpreter = LiteRTInterpreter(model_path=MODEL_LSTM)
+                self.interpreter.allocate_tensors()
+                self.input_details  = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
+                interpreter_ok = True
+                logging.info("LSTM OK via ai_edge_litert")
+            except Exception as e:
+                logging.warning(f"LSTM ai_edge_litert gagal: {e}, coba tensorflow...")
+
+        # -- Fallback ke TensorFlow penuh --
+        if not interpreter_ok:
+            try:
+                import tensorflow as tf
+                self.interpreter = tf.lite.Interpreter(model_path=MODEL_LSTM)
+                self.interpreter.allocate_tensors()
+                self.input_details  = self.interpreter.get_input_details()
+                self.output_details = self.interpreter.get_output_details()
+                interpreter_ok = True
+                logging.info("LSTM OK via tensorflow")
+            except Exception as e:
+                logging.error(f"LSTM tensorflow juga gagal: {e}")
+                self.interpreter = None
+                return
+
+        # -- Load scaler & encoder --
+        try:
+            self.scaler_in  = joblib.load(SCALER_LSTM)
+            self.scaler_out = joblib.load(SCALER_TARGET)
+            self.encoder    = joblib.load(ENCODER_LSTM)
+            logging.info("LSTM scaler & encoder OK")
+        except Exception as e:
+            logging.error(f"LSTM scaler/encoder gagal: {e}")
+            self.scaler_in  = None
+            self.scaler_out = None
+            self.encoder    = None
+
+        # -- Deteksi otomatis index output nilai vs status --
+        # Output "nilai" berbentuk 3D (1, HORIZON, N_TARGET), output "status"
+        # berbentuk 2D (1, N_KELAS). Kita bedakan dari rank shape, bukan index tetap,
+        # karena N_TARGET dan N_KELAS bisa kebetulan sama panjang (mis. sama-sama 4)
+        # sehingga tidak bisa dibedakan hanya dari panjangnya.
+        if interpreter_ok and self.output_details:
+            for i, det in enumerate(self.output_details):
+                if len(det["shape"]) >= 3:
+                    self.idx_nilai = i
+                elif len(det["shape"]) == 2:
+                    self.idx_status = i
+            if self.idx_nilai is None or self.idx_status is None:
+                logging.warning(
+                    f"LSTM: tidak bisa deteksi otomatis index output "
+                    f"(shapes={[d['shape'] for d in self.output_details]}), "
+                    f"pakai default [0]=nilai, [1]=status"
+                )
+                self.idx_nilai  = 0
+                self.idx_status = 1
+            else:
+                logging.info(
+                    f"LSTM: output nilai=index {self.idx_nilai}, "
+                    f"output status=index {self.idx_status}"
+                )
+
+    def prediksi(self, buffer_data: list):
+        """
+        Prediksi nilai sensor & status risiko ke depan.
+
+        Parameter:
+            buffer_data: list of dict, panjang = TIMESTEP
+                         [{suhu, kelembapan, pm1_0, pm2_5, pm10, tinggi_air}, ...]
+
+        Return:
+            dict {prediksi_nilai, prediksi_status} atau None jika gagal
+        """
+        if self.interpreter is None or len(buffer_data) < TIMESTEP:
+            return None
+        if self.scaler_in is None or self.scaler_out is None or self.encoder is None:
+            logging.error("LSTM prediksi gagal: scaler/encoder None")
+            return None
+        try:
+            # Susun array input (TIMESTEP, N_FITUR)
+            X = np.array(
+                [[row[f] for f in FITUR_INPUT] for row in buffer_data],
+                dtype=np.float32
+            )
+            X_scaled = self.scaler_in.transform(X)
+            X_batch  = X_scaled[np.newaxis, ...]   # (1, TIMESTEP, N_FITUR)
+
+            # Inferensi TFLite
+            self.interpreter.set_tensor(
+                self.input_details[0]["index"], X_batch
+            )
+            self.interpreter.invoke()
+
+            # Output nilai: (1, HORIZON, N_TARGET) - index dideteksi otomatis di _load()
+            out_nilai  = self.interpreter.get_tensor(
+                self.output_details[self.idx_nilai]["index"]
+            )[0]
+
+            # Output status: (1, N_KELAS) - index dideteksi otomatis di _load()
+            out_status = self.interpreter.get_tensor(
+                self.output_details[self.idx_status]["index"]
+            )[0]
+
+            # Pengaman tambahan: pastikan out_nilai 2D (HORIZON, N_TARGET)
+            # sebelum inverse_transform, kalau-kalau shape model tidak sesuai dugaan.
+            out_nilai = np.asarray(out_nilai)
+            if out_nilai.ndim == 1:
+                out_nilai = out_nilai.reshape(HORIZON, len(FITUR_TARGET))
+
+            # Inverse transform nilai sensor
+            pred_nilai_nyata = self.scaler_out.inverse_transform(out_nilai)
+
+            # Format prediksi nilai per fitur
+            prediksi_nilai = {}
+            for j, fitur in enumerate(FITUR_TARGET):
+                prediksi_nilai[fitur] = [
+                    round(float(pred_nilai_nyata[h][j]), 2)
+                    for h in range(HORIZON)
+                ]
+
+            # Decode status risiko per horizon
+            prediksi_status = [
+                self.encoder.inverse_transform(
+                    [np.argmax(out_status)]
+                )[0]
+            ] * HORIZON
+
+            return {
+                "prediksi_nilai" : prediksi_nilai,
+                "prediksi_status": prediksi_status,
+            }
+
+        except Exception as e:
+            logging.error(f"LSTM prediksi error: {e}")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DATA CNN — baca dari deforestasi.json
+# ═══════════════════════════════════════════════════════════════════
+
+class DataCNN:
+    """
+    Baca hasil CNN dari deforestasi.json.
+    File ini dibuat sekali saat setup dengan predict_cnn.py.
+    Jika file tidak ada, kembalikan nilai default.
+    """
+
+    def __init__(self):
+        self.data = self._load()
+
+    def _load(self):
+        if not os.path.exists(DEFOR_PATH):
+            logging.warning(f"deforestasi.json tidak ditemukan di {DEFOR_PATH}")
+            return {
+                "status_deforestasi" : "Tidak Diketahui",
+                "prob_deforestasi"   : 0.0,
+                "prob_forest"        : 0.0,
+                "kelas"              : "Tidak Diketahui",
+                "file_gambar"        : "-",
+                "waktu_proses"       : "-",
+            }
+        try:
+            with open(DEFOR_PATH, "r") as f:
+                data = json.load(f)
+            logging.info(f"CNN data dimuat: {data.get('status_deforestasi')}")
+            return data
+        except Exception as e:
+            logging.error(f"Gagal baca deforestasi.json: {e}")
+            return {"status_deforestasi": "Error", "prob_deforestasi": 0.0}
+
+    def get(self):
+        """Kembalikan dict data CNN."""
+        return self.data
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CURAH HUJAN — threshold biasa (BUKAN model) + confidence/prediksi acak
+# ═══════════════════════════════════════════════════════════════════
+
+def klasifikasi_hujan(curah_hujan):
+    """
+    Klasifikasi curah hujan (mm/jam) dengan THRESHOLD biasa, tanpa model:
+        0  <= x <  5   -> Aman
+        5  <= x <  10  -> Waspada
+        10 <= x <= 20  -> Siaga
+        x  >  20       -> Bahaya
+    Return string status, atau None jika curah_hujan None.
+    """
+    if curah_hujan is None:
+        return None
+    if curah_hujan < HUJAN_BATAS_WASPADA:
+        return "Aman"
+    if curah_hujan < HUJAN_BATAS_SIAGA:
+        return "Waspada"
+    if curah_hujan <= HUJAN_BATAS_BAHAYA:
+        return "Siaga"
+    return "Bahaya"
+
+
+def prediksi_curah_hujan_acak(curah_hujan):
+    """
+    Prediksi curah hujan SINTETIS (bukan LSTM): nilai sensor + acak dalam
+    +-HUJAN_PRED_DELTA_MAX mm/jam. Tidak pernah negatif — kalau hasil < 0,
+    nilainya dipantulkan (abs) sehingga selisih ke sensor tetap <= batas.
+    """
+    if curah_hujan is None:
+        return None
+    if not HUJAN_STATE["baca"]:
+        return 0.0          # saklar baca sensor hujan OFF -> prediksi selalu 0
+    nilai = curah_hujan + random.uniform(-HUJAN_PRED_DELTA_MAX, HUJAN_PRED_DELTA_MAX)
+    return round(abs(nilai), 2)
+
+
+def analisis_hujan(curah_hujan):
+    """
+    Satu paket hasil untuk curah hujan (dipanggil main.py & simulasi.py tiap siklus):
+        {
+          "status"         : status dari threshold (nilai sensor),
+          "confidence"     : ACAK HUJAN_CONF_MIN..HUJAN_CONF_MAX (persen),
+          "prediksi_nilai" : prediksi acak (mm/jam),
+          "prediksi_status": status dari threshold yang sama utk nilai prediksi,
+        }
+    Return None jika curah_hujan None (sensor hujan gagal / dinonaktifkan).
+    """
+    if curah_hujan is None:
+        return None
+    pred = prediksi_curah_hujan_acak(curah_hujan)
+    return {
+        "status"         : klasifikasi_hujan(curah_hujan),
+        "confidence"     : round(random.uniform(HUJAN_CONF_MIN, HUJAN_CONF_MAX), 2),
+        "prediksi_nilai" : pred,
+        "prediksi_status": klasifikasi_hujan(pred),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# KIRIM DATA (kirim_data.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# kirim_data.py — Kirim data ke predikta.site via HTTP POST (PREDIKTA)
+#
+# Modul ini SEKARANG independen untuk SATU server saja: predikta.site
+# (payload lengkap SVM + LSTM + CNN). Format payload & API_KEY TIDAK diubah
+# dari versi SiPrediksi lama, supaya PHP di server tidak perlu disentuh.
+#
+# Semua yang berkaitan dengan server kedua (airprema.site / Bi-LSTM
+# kualitas udara) sudah DIHAPUS TOTAL dari modul ini — tidak ada lagi
+# payload/format/URL/API key kedua, tidak ada lagi status pengiriman ganda
+# per entri. Setiap entri di antrian sekarang hanya punya SATU status
+# ("terkirim") dan dibuang dari antrian setelah berhasil terkirim.
+#
+# Sumber data: antrian JSON (data/antrian_kirim.json) yang ditulis oleh
+# database.tambah_antrian() setiap siklus di main.py / simulasi.py.
+#
+# Fitur:
+#   - Kirim data ke server
+#   - Antrian offline: jika koneksi putus, data tetap tersimpan di JSON
+#   - Auto-retry saat koneksi/server pulih
+#
+
+
+try:
+    import requests
+    REQUESTS_OK = True
+except ImportError:
+    REQUESTS_OK = False
+
+
+def cek_koneksi():
+    """Cek apakah ada koneksi internet."""
+    if not REQUESTS_OK:
+        return False
+    try:
+        r = requests.get("https://1.1.1.1", timeout=5)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FORMAT PAYLOAD — predikta.site
+# ═══════════════════════════════════════════════════════════════════
+
+def format_payload_predikta(entri):
+    """
+    Format satu entri antrian menjadi dict JSON untuk predikta.site.
+    STRUKTUR FIELD TIDAK DIUBAH dari versi SiPrediksi lama (field-by-field
+    sama persis) supaya kompatibel dengan PHP yang sudah ada di server.
+    """
+    s    = entri.get("sensor", {})
+    svm  = entri.get("svm", {})
+    lstm = entri.get("lstm", {})
+    pr   = entri.get("prediksi_risiko", {})
+    cnn  = entri.get("cnn", {})
+    prob = svm.get("prob", {})
+
+    # Klasifikasi per bencana — masing-masing dari SVM sendiri
+    bencana     = entri.get("bencana", {})
+    kebakaran   = bencana.get("kebakaran", {})
+    banjir      = bencana.get("banjir", {})
+    pencemaran  = bencana.get("pencemaran", {})
+    prob_keb    = kebakaran.get("prob", {})
+    prob_banj   = banjir.get("prob", {})
+    prob_penc   = pencemaran.get("prob", {})
+
+    # Curah hujan (BARU) — threshold + confidence/prediksi acak. Entri antrian lama
+    # (sebelum revisi ini) tidak punya key "hujan" -> semua field hujan jadi None.
+    hujan       = entri.get("hujan", {}) or {}
+
+    return {
+        "api_key": API_KEY,
+        "timestamp": entri.get("timestamp"),
+        "lokasi": entri.get("lokasi", "ketapang"),
+        "suhu": s.get("suhu"),
+        "kelembapan": s.get("kelembapan"),
+        "pm1_0": s.get("pm1_0"),
+        "pm2_5": s.get("pm2_5"),
+        "pm10": s.get("pm10"),
+        "tinggi_air": s.get("tinggi_air"),
+        "sumber": s.get("sumber", "sensor"),
+        "status_risiko": svm.get("status"),
+        "confidence_svm": svm.get("confidence"),
+        "prob_aman": prob.get("Aman"),
+        "prob_waspada": prob.get("Waspada"),
+        "prob_siaga": prob.get("Siaga"),
+        "prob_bahaya": prob.get("Bahaya"),
+        "prediksi_nilai": lstm.get("prediksi_nilai"),
+        "prediksi_status": lstm.get("prediksi_status"),
+        "prediksi_risiko_status": pr.get("status"),
+        "prediksi_risiko_confidence": pr.get("confidence"),
+        "status_deforestasi": cnn.get("status_deforestasi"),
+        "prob_deforestasi": cnn.get("prob_deforestasi"),
+        # ── Klasifikasi per bencana ──
+        "status_kebakaran": kebakaran.get("status"),
+        "confidence_kebakaran": kebakaran.get("confidence"),
+        "prob_kebakaran_aman": prob_keb.get("Aman"),
+        "prob_kebakaran_waspada": prob_keb.get("Waspada"),
+        "prob_kebakaran_siaga": prob_keb.get("Siaga"),
+        "prob_kebakaran_bahaya": prob_keb.get("Bahaya"),
+        "status_banjir": banjir.get("status"),
+        "confidence_banjir": banjir.get("confidence"),
+        "prob_banjir_aman": prob_banj.get("Aman"),
+        "prob_banjir_waspada": prob_banj.get("Waspada"),
+        "prob_banjir_siaga": prob_banj.get("Siaga"),
+        "prob_banjir_bahaya": prob_banj.get("Bahaya"),
+        "status_pencemaran": pencemaran.get("status"),
+        "confidence_pencemaran": pencemaran.get("confidence"),
+        "prob_pencemaran_aman": prob_penc.get("Aman"),
+        "prob_pencemaran_waspada": prob_penc.get("Waspada"),
+        "prob_pencemaran_siaga": prob_penc.get("Siaga"),
+        "prob_pencemaran_bahaya": prob_penc.get("Bahaya"),
+        # ── Curah hujan (BARU) — satuan mm/jam ──
+        "curah_hujan": s.get("curah_hujan"),
+        "status_hujan": hujan.get("status"),
+        "confidence_hujan": hujan.get("confidence"),
+        "prediksi_curah_hujan": hujan.get("prediksi_nilai"),
+        "prediksi_status_hujan": hujan.get("prediksi_status"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PENGIRIMAN
+# ═══════════════════════════════════════════════════════════════════
+
+def _kirim_batch(url, payload_list, api_key):
+    """
+    Kirim list payload ke predikta.site via HTTP POST (array JSON, batch insert).
+
+    PENTING: api_key WAJIB dikirim lewat HTTP header 'X-API-Key', karena
+    fungsi cek_api_key() di server (config/auth.php) hanya mengecek header
+    HTTP_X_API_KEY atau $_POST['api_key'] — TIDAK membaca field 'api_key'
+    di dalam body JSON. Field 'api_key' tetap disertakan di tiap item
+    payload (lihat format_payload_predikta) untuk kompatibilitas/dokumentasi,
+    tapi itu TIDAK dipakai untuk autentikasi oleh server — autentikasi murni
+    lewat header ini.
+
+    Mengembalikan (sukses: bool, pesan: str).
+    """
+    if not REQUESTS_OK:
+        return False, "requests tidak terinstall"
+    if not payload_list:
+        return True, "tidak ada data"
+
+    try:
+        r = requests.post(
+            url,
+            json    = {"data": payload_list},
+            headers = {
+                "Content-Type": "application/json",
+                "X-API-Key"   : api_key,
+            },
+            timeout = HTTP_TIMEOUT,
+        )
+        if r.status_code == 200:
+            resp = r.json()
+            if resp.get("status") == "ok":
+                return True, f"Terkirim {len(payload_list)} data"
+            else:
+                return False, f"Server error: {resp.get('pesan', 'unknown')}"
+        else:
+            detail = ""
+            try:
+                detail = f" — {r.json().get('pesan', '')}"
+            except Exception:
+                cuplikan = r.text[:150] if r.text else ""
+                if cuplikan:
+                    detail = f" — {cuplikan}"
+            return False, f"HTTP {r.status_code}{detail}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _proses_target(antrian, url, api_key, format_fn, nama_log):
+    """
+    Kirim semua entri yang belum terkirim ke predikta.site.
+    Menandai entri sukses secara in-place di `antrian` (list of dict).
+    Return (jumlah_sukses, pesan).
+    """
+    belum_kirim = [e for e in antrian if not e.get("terkirim", False)]
+    if not belum_kirim:
+        return 0, "tidak ada data"
+
+    payload_list = [format_fn(e) for e in belum_kirim]
+    sukses, pesan = _kirim_batch(url, payload_list, api_key)
+
+    if sukses:
+        for e in belum_kirim:
+            e["terkirim"] = True
+        catat_kirim_log(nama_log, "sukses", pesan, len(belum_kirim))
+        logging.info(f"[KIRIM {nama_log}] {pesan}")
+        return len(belum_kirim), pesan
+    else:
+        catat_kirim_log(nama_log, "gagal", pesan, 0)
+        logging.error(f"[KIRIM {nama_log} GAGAL] {pesan}")
+        return 0, pesan
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FUNGSI UTAMA — dipanggil dari main.py / simulasi.py
+# ═══════════════════════════════════════════════════════════════════
+
+def proses_pengiriman():
+    """
+    Fungsi utama pengiriman, dipanggil tiap INTERVAL_KIRIM:
+      1. Muat antrian JSON
+      2. Jika ada koneksi -> kirim ke predikta.site
+      3. Entri yang sudah terkirim dibuang dari antrian
+      4. Jika tidak ada koneksi -> log peringatan, coba lagi nanti
+    """
+    antrian = _muat_antrian()
+    if not antrian:
+        return
+
+    if not cek_koneksi():
+        logging.warning(f"Koneksi tidak tersedia. {len(antrian)} data pending di antrian.")
+        return
+
+    _proses_target(antrian, SERVER_URL, API_KEY, format_payload_predikta, "predikta")
+
+    sisa = [e for e in antrian if not e.get("terkirim")]
+
+    if len(sisa) != len(antrian):
+        logging.info(f"{len(antrian) - len(sisa)} entri selesai terkirim, dibuang dari antrian")
+
+    _simpan_antrian(sisa)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CNN SETUP (prediksi_cnn_setup.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# prediksi_cnn_setup.py — Setup CNN di Raspberry Pi (PREDIKTA) (jalankan SEKALI)
+#
+# Script ini dijalankan satu kali saat instalasi alat di lapangan:
+#   1. Load model_cnn.tflite dari folder models/
+#   2. Baca file gambar lahan yang disiapkan
+#   3. Prediksi kelas deforestasi
+#   4. Simpan hasil ke data/deforestasi.json
+#   5. File JSON tersebut dipakai sistem secara permanen
+#
+# Jalankan:
+#   python prediksi_cnn_setup.py --gambar foto_lahan.png
+#   python prediksi_cnn_setup.py --gambar foto_lahan.png --preview
+#
+
+
+# Import config RPi
+
+
+IMG_SIZE         = (224, 224)
+THRESHOLD_TINGGI = 0.70
+THRESHOLD_SEDANG = 0.40
+
+
+WARNA_STATUS = {"Rendah": HIJAU, "Sedang": KUNING, "Tinggi": MERAH2}
+EMOJI_STATUS = {"Rendah": "🌿", "Sedang": "⚠️ ", "Tinggi": "🚨"}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LOAD MODEL TFLITE
+# ═══════════════════════════════════════════════════════════════════
+
+def load_interpreter():
+    """
+    Load model CNN TFLite dari folder models/.
+    Coba tflite_runtime dulu (lebih ringan), fallback ke TensorFlow penuh.
+    """
+    if not os.path.exists(MODEL_CNN):
+        print(f"  {MERAH}[ERROR]{RESET} File '{MODEL_CNN}' tidak ditemukan!")
+        print("  Pastikan model_cnn.tflite sudah disalin ke folder models/")
+        sys.exit(1)
+
+    try:
+        import tflite_runtime.interpreter as tflite
+        interp = tflite.Interpreter(model_path=MODEL_CNN)
+        backend = "tflite_runtime"
+    except ImportError:
+        try:
+            from ai_edge_litert.interpreter import Interpreter as LiteRTInterpreter
+            interp = LiteRTInterpreter(model_path=MODEL_CNN)
+            backend = "ai_edge_litert"
+        except ImportError:
+            try:
+                import tensorflow as tf
+                interp = tf.lite.Interpreter(model_path=MODEL_CNN)
+                backend = "tensorflow"
+            except ImportError:
+                print(f"  {MERAH}[ERROR]{RESET} Tidak ada TFLite runtime!")
+                print("  Install salah satu:")
+                print("    pip install ai-edge-litert --break-system-packages   (untuk Python 3.12/3.13)")
+                print("    pip install tflite-runtime --break-system-packages   (untuk Python <=3.11)")
+                sys.exit(1)
+
+    interp.allocate_tensors()
+    inp = interp.get_input_details()
+    out = interp.get_output_details()
+    print(f"  {HIJAU}✓{RESET} Model CNN dimuat ({backend})")
+    print(f"  {HIJAU}✓{RESET} Input  : {inp[0]['shape']}")
+    print(f"  {HIJAU}✓{RESET} Output : {out[0]['shape']}")
+    return interp, inp, out
+
+
+# ═══════════════════════════════════════════════════════════════════
+# PREPROCESSING & INFERENSI
+# ═══════════════════════════════════════════════════════════════════
+
+def preprocessing(path_gambar):
+    """Load gambar → RGB → resize 224×224 → normalisasi → batch."""
+    if not os.path.exists(path_gambar):
+        print(f"  {MERAH}[ERROR]{RESET} Gambar '{path_gambar}' tidak ditemukan!")
+        sys.exit(1)
+
+    ekstensi = os.path.splitext(path_gambar)[1].lower()
+    if ekstensi not in (".png", ".jpg", ".jpeg", ".bmp", ".tiff"):
+        print(f"  {MERAH}[ERROR]{RESET} Format '{ekstensi}' tidak didukung.")
+        sys.exit(1)
+
+    img     = Image.open(path_gambar).convert("RGB")
+    ukuran  = img.size
+    resized = img.resize(IMG_SIZE, Image.LANCZOS)
+    arr     = np.array(resized, dtype=np.float32) / 255.0
+    batch   = np.expand_dims(arr, axis=0)
+    return batch, ukuran
+
+
+def inferensi(interp, inp_details, out_details, img_batch):
+    """Jalankan inferensi TFLite, kembalikan (prob_forest, prob_defor)."""
+    interp.set_tensor(inp_details[0]["index"], img_batch)
+    interp.invoke()
+    output     = interp.get_tensor(out_details[0]["index"])[0][0]
+    prob_forest = float(output)
+    prob_defor  = 1.0 - prob_forest
+    return prob_forest, prob_defor
+
+
+def tentukan_status(prob_defor):
+    """Tentukan status deforestasi berdasarkan threshold."""
+    if prob_defor > THRESHOLD_TINGGI:
+        return "Tinggi"
+    elif prob_defor >= THRESHOLD_SEDANG:
+        return "Sedang"
+    else:
+        return "Rendah"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TAMPILKAN & SIMPAN
+# ═══════════════════════════════════════════════════════════════════
+
+def tampilkan_hasil(path_gambar, ukuran, kelas, prob_defor, prob_forest, status):
+    """Tampilkan hasil di terminal."""
+    warna = WARNA_STATUS.get(status, RESET)
+    emoji = EMOJI_STATUS.get(status, "")
+    pct_d = prob_defor  * 100
+    pct_f = prob_forest * 100
+
+    def bar(pct, w):
+        n = int(pct / 2.5)
+        return f"{w}{'█'*n}{RESET}{'░'*(40-n)}"
+
+    print(f"\n  {'─'*54}")
+    print(f"  File    : {os.path.basename(path_gambar)}")
+    print(f"  Ukuran  : {ukuran[0]}×{ukuran[1]} px {ABU}→ resize 224×224{RESET}")
+    print(f"  {'─'*54}")
+    print(f"\n  {BOLD}Prediksi : {'DEFORESTATION' if kelas=='deforestation' else 'FOREST'}{RESET}")
+    print(f"\n  Probabilitas:")
+    print(f"    {MERAH2}Deforestation{RESET}  {bar(pct_d, MERAH2)} {pct_d:5.1f}%")
+    print(f"    {HIJAU}Forest       {RESET}  {bar(pct_f, HIJAU)} {pct_f:5.1f}%")
+    print(f"\n  {'─'*54}")
+    print(f"  Status Deforestasi : {emoji} {warna}{BOLD}{status}{RESET}")
+    print(f"  {'─'*54}")
+
+
+def simpan_hasil(path_gambar, kelas, prob_defor, prob_forest, status):
+    """
+    Simpan hasil ke deforestasi.json di folder data/.
+    File ini dibaca oleh main.py setiap siklus sebagai nilai tetap.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
+
+    hasil = {
+        "file_gambar"        : os.path.basename(path_gambar),
+        "kelas"              : kelas,
+        "prob_deforestasi"   : round(prob_defor,  4),
+        "prob_forest"        : round(prob_forest, 4),
+        "status_deforestasi" : status,
+        "waktu_proses"       : datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "threshold_tinggi"   : THRESHOLD_TINGGI,
+        "threshold_sedang"   : THRESHOLD_SEDANG,
+        "catatan"            : "Diproses saat instalasi di lapangan. Nilai permanen selama operasional.",
+    }
+
+    with open(DEFOR_PATH, "w") as f:
+        json.dump(hasil, f, indent=2)
+
+    print(f"\n  {HIJAU}✓{RESET} Hasil disimpan → {DEFOR_PATH}")
+    print(f"  {HIJAU}✓{RESET} Sistem akan menggunakan nilai ini secara permanen.")
+    return hasil
+
+
+# ═══════════════════════════════════════════════════════════════════
+# CEK STATUS DEFORESTASI.JSON
+# ═══════════════════════════════════════════════════════════════════
+
+def cek_existing():
+    """Tampilkan isi deforestasi.json yang sudah ada (jika ada)."""
+    if not os.path.exists(DEFOR_PATH):
+        print(f"  {KUNING}deforestasi.json belum ada.{RESET}")
+        return
+    with open(DEFOR_PATH, "r") as f:
+        data = json.load(f)
+    print(f"\n  {BOLD}deforestasi.json yang sudah ada:{RESET}")
+    for k, v in data.items():
+        print(f"    {k:<25}: {v}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════════
+
+
+# ═══════════════════════════════════════════════════════════════════
+# MODE SIMULASI / MAIN (main.py)
+# ═══════════════════════════════════════════════════════════════════
+#
+#
+# simulasi.py — Mode SIMULASI/DEMO untuk testing pipeline & website PREDIKTA
+#
+# PENTING — BACA DULU:
+#   Modul ini HANYA dipakai untuk pengujian end-to-end (dashboard, grafik,
+#   mekanisme pengiriman ke server, penyimpanan SQLite). Modul ini BUKAN
+#   untuk mengukur akurasi model LSTM yang sebenarnya, dan BUKAN pengganti
+#   mode sensor nyata (MODE_DUMMY=False) maupun mode dummy (sensor.py) —
+#   justru SEKARANG modul ini MEMAKAI baca_sensor() dari sensor.py sebagai
+#   dasar nilai simulasinya (lihat alur di bawah).
+#
+#   "prediksi_nilai" yang dihasilkan di sini adalah data SINTETIS (generator
+#   tren+noise, BUKAN LSTM asli) dan TIDAK BOLEH dianggap sebagai hasil
+#   prediksi LSTM yang sebenarnya.
+#
+# Aturan yang dijaga di modul ini:
+#   - TIDAK mengimpor PrediksiLSTM. TIDAK memuat/menjalankan model_lstm.tflite.
+#   - PrediksiSVM ASLI tetap dipakai untuk klasifikasi status risiko, supaya
+#     status & confidence yang tampil bukan angka karangan.
+#   - Setiap baris tetap melewati database.py & kirim_data.py apa adanya,
+#     supaya format data yang diterima website identik dengan mode normal.
+#   - Semua baris log diberi awalan "[A2]".
+#   - Field `sumber="simulasi"` WAJIB ikut terkirim, supaya data simulasi
+#     tetap bisa difilter/dibedakan dari data sensor produksi asli.
+#   - HANYA independen untuk predikta.site — modul ini TIDAK LAGI mengenal
+#     konsep "Jalur B"/airprema.site sama sekali (sudah dihapus total,
+#     termasuk state, generator, dan pengiriman payload keduanya).
+#
+# ALUR SATU JALUR (predikta.site), PER SIKLUS:
+#
+#   1. BACA SENSOR DULU — baca_sensor() dipanggil di awal setiap siklus,
+#      memakai jalur yang SAMA dengan mode normal (MODE_DUMMY menentukan
+#      dummy vs sensor fisik). Ini "data sensor" apa adanya untuk siklus ini.
+#
+#   2. Kalau histori SQLite (via ambil_buffer_lstm) BELUM cukup TIMESTEP
+#      baris, "data sensor" hasil baca_sensor() dipakai APA ADANYA sebagai
+#      baris yang disimpan/dikirim (belum ada forecast pembanding, jadi
+#      belum ada yang perlu "disimulasikan").
+#
+#   3. Begitu buffer cukup, generate_prediksi_simulasi() dihitung ULANG
+#      (fresh, generator sintetis tren+noise+mean-reversion) dari buffer
+#      TERBARU untuk mendapatkan forecast H+1..H+SIMULASI_HORIZON.
+#
+#   4. BARU SIMULASIKAN NILAINYA — generate_data_simulasi() menghitung
+#      "data aktual simulasi" untuk siklus ini dengan MENARIK forecast H+1
+#      ke ARAH pembacaan sensor riil langkah (1) tadi. Jarak tarikannya
+#      (deviasi) ditentukan oleh akurasi acak dari distribusi 5-pita
+#      SIMULASI_PREDIKTA_AKURASI (lihat config.py), dan DIBATASI supaya
+#      tidak pernah melewati nilai sensor asli — hasilnya SELALU berada di
+#      antara "data prediksi" dan "data sensor" (lihat contoh di bawah).
+#      Inilah baris yang disimpan ke SQLite & dikirim ke predikta.site.
+#
+#   Contoh pola yang dihasilkan (suhu/PM/dst — angka ilustrasi):
+#       data sensor | data prediksi | data simulasi
+#            92      |      98       |      96
+#            68      |      78       |      72
+#            67      |      50       |      58
+#            45      |      55       |      48
+#            32      |      53       |      44
+#            70      |      32       |      38
+#   "data simulasi" selalu berada di antara "data prediksi" dan "data
+#   sensor" — rentangnya mengikuti pembacaan sensor aktual, tapi jaraknya
+#   ke "data prediksi" tetap dikontrol oleh akurasi acak (lihat
+#   generate_data_simulasi()).
+#
+# Fitur FIXED (tidak pernah mengikuti forecast/tarikan sensor):
+#   - tinggi_air        selalu 0
+#   - prob_deforestasi  selalu nilai dari deforestasi.json (fallback 0.317)
+#   - co_mq7            tidak disimulasikan di modul ini (selalu None)
+#   - curah_hujan       memakai DATA REAL sensor hujan apa adanya (dari baca_sensor()) —
+#                       TIDAK ditarik ke arah forecast & TIDAK disimulasikan. Klasifikasi =
+#                       threshold biasa; confidence & prediksi acak (prediksi.analisis_hujan)
+#
+# Batas PM (revisi terbaru): PM1.0, PM2.5, PM10 masing-masing 0..150 µg/m³ dan
+# SELALU berurutan PM1.0 < PM2.5 < PM10 (lihat _paksa_urutan_pm).
+#
+
+
+# PENTING: PrediksiLSTM SENGAJA TIDAK diimpor di modul ini.
+
+
+# ── Warna terminal (gaya sama seperti main.py) ───────────────────
+
+WARNA_RISIKO = {
+    "Aman"    : HIJAU,  "Waspada": KUNING,
+    "Siaga"   : MERAH,  "Bahaya" : MERAH2,
+}
+
+# Fitur yang ikut diprediksi & disimulasikan (tinggi_air FIXED, lihat docstring modul ini)
+_FITUR_WALK = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10"]
+
+# Titik tengah mean-reversion untuk forecast (generate_prediksi_simulasi) —
+# TIDAK LAGI dipakai sebagai titik awal random-walk "data sensor" (sekarang
+# "data sensor" selalu datang dari baca_sensor() real/dummy), hanya dipakai
+# supaya tren forecast sintetis tidak melenceng liar tanpa batas antar-siklus.
+_NILAI_AWAL = {
+    "suhu"       : 33.12,
+    "kelembapan" : 58.90,
+    "pm1_0"      : 40,
+    "pm2_5"      : 70,
+    "pm10"       : 110,
+}
+
+# Batas nilai realistis per fitur — dipakai untuk clamp forecast & hasil
+# akhir "data simulasi" (bukan untuk membatasi pembacaan sensor asli).
+# PM: batas bawah 0 (konsentrasi tidak bisa negatif), batas atas 150 masing-masing.
+_BATAS_NILAI = {
+    "suhu"       : (20.0, 40.0),
+    "kelembapan" : (35.0, 85.0),
+    "pm1_0"      : (0, 150),
+    "pm2_5"      : (0, 150),
+    "pm10"       : (0, 150),
+}
+
+# Skala deviasi maksimum forecast (sbg fraksi lebar rentang fitur) — dipakai
+# HANYA oleh generate_prediksi_simulasi() untuk membatasi tren antar-horizon,
+# TIDAK dipakai lagi oleh generate_data_simulasi() (lihat fungsi itu: deviasi
+# akurasi sekarang dihitung relatif terhadap nilai prediksi, bukan lebar
+# rentang fitur).
+_BATAS_TREN = {"suhu": 0.5, "kelembapan": 1.0, "pm1_0": 8, "pm2_5": 10, "pm10": 10}
+
+
+def _clamp(fitur, nilai, batas_dict=None):
+    """
+    Batasi nilai ke rentang realistis fitur tsb.
+
+    Overshoot (nilai > hi atau < lo) "dipantulkan" balik ke dalam rentang
+    (reflect) supaya variasinya tetap wajar; hard clamp cuma dipakai sbg
+    fallback kalau pantulannya masih di luar rentang (overshoot ekstrem).
+    """
+    batas_dict = batas_dict or _BATAS_NILAI
+    batas = batas_dict.get(fitur)
+    if batas is None:
+        return nilai
+    lo, hi = batas
+    if nilai > hi:
+        nilai = hi - (nilai - hi)
+    elif nilai < lo:
+        nilai = lo + (lo - nilai)
+    return max(lo, min(hi, nilai))
+
+
+def _bulatkan(fitur, nilai):
+    """PM dibulatkan ke bilangan bulat (mengikuti pola contoh), fitur lain 2 desimal."""
+    if fitur in ("pm1_0", "pm2_5", "pm10"):
+        return round(nilai)
+    return round(nilai, 2)
+
+
+PM_MAKS = 150
+
+
+def _paksa_urutan_pm(d):
+    """
+    Pastikan pm1_0 < pm2_5 < pm10 dan semuanya <= PM_MAKS (150).
+    Bekerja in-place pada dict, hasilnya bilangan bulat.
+    Selisih minimal antar-PM = 1 µg/m³ (syarat '<' murni).
+    """
+    if not all(k in d and d[k] is not None for k in ("pm1_0", "pm2_5", "pm10")):
+        return d
+    pm1  = int(max(0, min(PM_MAKS - 2, round(d["pm1_0"]))))
+    pm25 = int(max(pm1 + 1, min(PM_MAKS - 1, round(d["pm2_5"]))))
+    pm10 = int(max(pm25 + 1, min(PM_MAKS, round(d["pm10"]))))
+    d["pm1_0"], d["pm2_5"], d["pm10"] = pm1, pm25, pm10
+    return d
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NILAI FIXED — deforestasi (diambil dari file asli, bukan random)
+# ═══════════════════════════════════════════════════════════════════
+
+def ambil_deforestasi_fixed():
+    """
+    Ambil data CNN dari deforestasi.json (via DataCNN, sama seperti mode
+    normal) supaya nilai FIXED simulasi tetap bersumber dari file asli,
+    bukan angka acak. Kalau file tidak ada/rusak, DataCNN sendiri sudah
+    punya fallback (prob_deforestasi=0.0) — kita timpa fallback itu jadi
+    0.317 sesuai contoh pola yang diminta, supaya mode simulasi tetap
+    bisa jalan walau deforestasi.json belum di-setup.
+    """
+    try:
+        data = DataCNN().get()
+        if data.get("prob_deforestasi") in (None, 0.0) and \
+           data.get("status_deforestasi") in ("Tidak Diketahui", "Error"):
+            logging.warning("[A2] deforestasi.json belum ada/rusak, pakai fallback prob_deforestasi=0.317")
+            data = dict(data)
+            data["prob_deforestasi"] = 0.317
+        return data
+    except Exception as e:
+        logging.warning(f"[A2] Gagal ambil deforestasi.json, pakai fallback 0.317: {e}")
+        return {"status_deforestasi": "Tidak Diketahui", "prob_deforestasi": 0.317}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DISTRIBUSI AKURASI — 5 PITA (prediksi vs simulasi)
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_akurasi_baru(pita=None):
+    """
+    Sampling akurasi (0-1) dari distribusi 5-pita SIMULASI_PREDIKTA_AKURASI
+    (lihat config.py):
+        10% di 50%-60%, 10% di 60%-70%, 20% di 70%-80%,
+        40% di 80%-90%, 20% di 90%-99%.
+
+    Cara kerja: pilih satu pita secara acak sesuai bobot probabilitasnya
+    (probabilitas kumulatif), lalu ambil UNIFORM dari rentang pita itu.
+
+    Return: float akurasi (0-1, mis. 0.91 = 91%).
+    """
+    pita = pita or SIMULASI_PREDIKTA_AKURASI
+    r = random.random()
+    kumulatif = 0.0
+    for lo, hi, prob in pita:
+        kumulatif += prob
+        if r <= kumulatif:
+            return random.uniform(lo, hi)
+    # Fallback jaga-jaga (mis. total probabilitas < 1.0 karena salah config)
+    lo, hi, _ = pita[-1]
+    return random.uniform(lo, hi)
+
+
+def cek_distribusi_akurasi(pita=None, n: int = 10000):
+    """
+    Utilitas debug/validasi manual (TIDAK dipanggil otomatis di alur
+    simulasi): generate `n` sampel akurasi dari generate_akurasi_baru(pita),
+    lalu hitung berapa persen yang jatuh di tiap pita, untuk memverifikasi
+    hasil generate benar-benar mendekati proporsi yang diminta.
+
+    Contoh pemakaian manual dari shell:
+        python3 -c "import simulasi; simulasi.cek_distribusi_akurasi()"
+    """
+    pita  = pita or SIMULASI_PREDIKTA_AKURASI
+    nilai = [generate_akurasi_baru(pita) for _ in range(n)]
+
+    print(f"n={n}  min={min(nilai):.4f}  max={max(nilai):.4f}  rata2={sum(nilai)/n:.4f}")
+    for lo, hi, prob_target in pita:
+        jumlah = sum(1 for a in nilai if lo <= a <= hi)
+        persen = jumlah / n * 100
+        print(f"Di pita [{lo:.2f}, {hi:.2f}]: {persen:5.1f}%  (target: {prob_target*100:.0f}%)")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STATE INTERNAL GENERATOR (dipertahankan antar siklus loop)
+# ═══════════════════════════════════════════════════════════════════
+
+class _StateSimulasi:
+    """
+    Menyimpan info yang perlu bertahan antar siklus loop simulasi.
+
+    Posisi "random-walk" data sensor TIDAK LAGI disimpan di sini — sejak
+    revisi ini, "data sensor" tiap siklus datang langsung dari baca_sensor()
+    (real/dummy), bukan dari generator internal modul ini. Histori untuk
+    forecast tetap diambil dari SQLite (ambil_buffer_lstm), sehingga
+    kontinuitas antar-restart otomatis terjaga tanpa perlu logika resume
+    terpisah.
+    """
+
+    def __init__(self, prob_defor):
+        self.prob_defor        = prob_defor
+        self.prediksi_terakhir = None   # forecast terakhir yang dihitung (utk referensi/tampilan)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# FORECAST SINTETIS (bukan LSTM)
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_prediksi_simulasi(buffer_terakhir, prob_defor, svm: "KlasifikasiUtama"):
+    """
+    Buat struktur prediksi sintetis semirip mungkin dengan output
+    PrediksiLSTM.prediksi(), TANPA memanggil LSTM sama sekali:
+
+        {"prediksi_nilai": {fitur: [...]}, "prediksi_status": [...]}
+
+    Melanjutkan tren linier dari buffer_terakhir (TIMESTEP baris terakhir
+    dari SQLite — histori ini sekarang berasal dari "data simulasi" yang
+    sudah ditarik ke arah sensor real/dummy tiap siklus, lihat
+    generate_data_simulasi()), dengan variasi kecil tiap horizon (tidak ada
+    lonjakan ekstrem). tinggi_air & prob_deforestasi FIXED. Status/confidence
+    per horizon diperoleh dari PrediksiSVM ASLI (bukan angka karangan).
+    """
+    prediksi_nilai = {f: [] for f in _FITUR_WALK}
+    prediksi_nilai["tinggi_air"] = [0] * SIMULASI_HORIZON
+
+    # Estimasi tren per fitur dari 2 baris terakhir buffer (kalau tersedia).
+    tren = {}
+    for fitur in _FITUR_WALK:
+        if len(buffer_terakhir) >= 2:
+            delta = buffer_terakhir[-1].get(fitur, 0) - buffer_terakhir[-2].get(fitur, 0)
+        else:
+            delta = 0.0
+        batas_t = _BATAS_TREN.get(fitur, 5)
+        tren[fitur] = max(-batas_t, min(batas_t, delta))
+
+    titik = {f: buffer_terakhir[-1].get(f, _NILAI_AWAL[f]) for f in _FITUR_WALK}
+
+    prediksi_status = []
+    for h in range(SIMULASI_HORIZON):
+        for fitur in _FITUR_WALK:
+            skala_noise = 6.0 if fitur in ("pm1_0", "pm2_5", "pm10") else 1.0
+            # Tarikan balik ringan ke titik tengah (_NILAI_AWAL) — mencegah
+            # tren terus membesar/menurun tanpa batas antar-batch (mean-reversion).
+            tarik_kembali = (_NILAI_AWAL[fitur] - titik[fitur]) * 0.08
+            titik[fitur]  = titik[fitur] + tren[fitur] * 0.6 + tarik_kembali \
+                            + random.gauss(0, 0.05) * skala_noise
+            titik[fitur]  = _clamp(fitur, titik[fitur])
+            prediksi_nilai[fitur].append(_bulatkan(fitur, titik[fitur]))
+
+        # Paksa PM1.0 < PM2.5 < PM10 (maks 150) untuk horizon ini
+        pm = {k: titik[k] for k in ("pm1_0", "pm2_5", "pm10")}
+        _paksa_urutan_pm(pm)
+        for k in ("pm1_0", "pm2_5", "pm10"):
+            titik[k] = pm[k]
+            prediksi_nilai[k][-1] = pm[k]
+
+        # Klasifikasi horizon ini pakai SVM asli — confidence TIDAK dikarang manual
+        titik_svm = {f: prediksi_nilai[f][h] for f in _FITUR_WALK}
+        titik_svm["tinggi_air"] = 0
+        hasil = svm.prediksi(titik_svm, prob_defor) if svm else None
+        prediksi_status.append(hasil["status"] if hasil else "?")
+
+    logging.info(f"[A2] Generate prediksi H+1 sampai H+{SIMULASI_HORIZON} (generator sintetis, BUKAN LSTM)")
+
+    return {
+        "prediksi_nilai" : prediksi_nilai,
+        "prediksi_status": prediksi_status,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# "DATA SIMULASI" — prediksi ditarik ke arah data sensor real/dummy
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_data_simulasi(data_sensor_asli: dict, target: dict,
+                            fitur_list=None, batas_dict=None):
+    """
+    Hitung "data simulasi" (nilai aktual yang dilaporkan) per fitur, dengan
+    menarik nilai `target` (forecast H+1 dari generate_prediksi_simulasi)
+    ke ARAH `data_sensor_asli[fitur]` (pembacaan sensor real/dummy siklus
+    ini, dari baca_sensor()) — BUKAN lagi ke arah acak.
+
+    Algoritma per fitur:
+        1. akurasi  = generate_akurasi_baru()   -> 0.50 - 0.99 (5 pita)
+        2. deviasi  = abs(prediksi) * (1 - akurasi)
+           (akurasi = 1 - abs(simulasi - prediksi) / abs(prediksi), lihat
+           formula terbalik di atas — makin tinggi akurasi, makin kecil
+           deviasi terhadap prediksi)
+        3. arah     = menuju data_sensor_asli (naik kalau sensor > prediksi,
+           turun kalau sensor < prediksi) — supaya rentang data simulasi
+           mengikuti rentang data sensor AKTUAL, bukan arah acak.
+        4. deviasi DIBATASI supaya tidak melewati jarak prediksi->sensor,
+           jadi hasil akhir SELALU berada di antara prediksi & sensor
+           (lihat contoh pola di docstring modul).
+        5. Hasil akhir tetap di-clamp ke rentang realistis fitur (_BATAS_NILAI).
+        6. (BARU) Setelah semua fitur selesai, PM dipaksa berurutan
+           PM1.0 < PM2.5 < PM10 dan <= 150 lewat _paksa_urutan_pm().
+
+    Return dict {fitur: nilai} MURNI NUMERIK — TIDAK menambahkan field
+    non-numerik (tinggi_air, co_mq7, sumber, timestamp); itu tanggung jawab
+    caller (generate_baris_simulasi).
+    """
+    fitur_list = fitur_list or _FITUR_WALK
+    batas_dict = batas_dict or _BATAS_NILAI
+
+    hasil = {}
+    for fitur in fitur_list:
+        nilai_prediksi = target[fitur]
+        nilai_sensor   = data_sensor_asli.get(fitur)
+        if nilai_sensor is None:
+            # Sensor fitur ini gagal dibaca (nilai None) -> pakai nilai prediksi,
+            # jadi tidak ada tarikan ke arah sensor (deviasi = 0).
+            logging.warning(f"[A2] Sensor '{fitur}' None, pakai nilai prediksi")
+            nilai_sensor = nilai_prediksi
+
+        akurasi = generate_akurasi_baru()
+        deviasi = abs(nilai_prediksi) * (1 - akurasi)
+
+        jarak_ke_sensor = abs(nilai_sensor - nilai_prediksi)
+        deviasi = min(deviasi, jarak_ke_sensor)   # jangan pernah melewati nilai sensor asli
+
+        arah       = 1 if nilai_sensor >= nilai_prediksi else -1
+        nilai_baru = nilai_prediksi + arah * deviasi
+
+        hasil[fitur] = _bulatkan(fitur, _clamp(fitur, nilai_baru, batas_dict))
+
+    _paksa_urutan_pm(hasil)
+    return hasil
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GENERATOR SATU BARIS — dipanggil tiap siklus loop simulasi
+# ═══════════════════════════════════════════════════════════════════
+
+def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
+    """
+    Hasilkan satu baris data untuk siklus mode simulasi saat ini.
+
+    ALUR (baca sensor dulu, baru simulasikan nilainya — lihat docstring
+    modul ini):
+      1. baca_sensor() dipanggil LEBIH DULU — data sensor real/dummy siklus
+         ini (bisa None kalau semua sensor inti gagal di mode nyata, sama
+         seperti main.py).
+      2. Kalau histori SQLite belum cukup TIMESTEP baris -> laporkan
+         pembacaan sensor apa adanya (belum ada forecast pembanding).
+      3. Kalau sudah cukup -> hitung forecast fresh (generate_prediksi_
+         simulasi), lalu tarik forecast H+1 ke arah pembacaan sensor tadi
+         (generate_data_simulasi) untuk mendapat "data simulasi" akhir.
+
+    Return (data_final, hasil_prediksi_untuk_disimpan_atau_None, ada_forecast)
+        data_final: None kalau semua sensor inti gagal dibaca (siklus
+                    dilewati oleh caller, sama seperti main.py).
+    """
+    data_sensor = baca_sensor()
+    _catat_sensor_aktual(data_sensor)   # BARU: hanya untuk panel status sensor (tidak memengaruhi data)
+    if data_sensor is None:
+        return None, None, False
+
+    data_sensor["tinggi_air"] = 0          # FIXED, lihat docstring modul ini
+    data_sensor["sumber"]     = "simulasi"
+
+    buffer = ambil_buffer_lstm(TIMESTEP)
+    if not buffer:
+        # Histori belum cukup untuk membuat forecast -> laporkan pembacaan
+        # sensor apa adanya, tidak ada yang bisa "disimulasikan" dulu.
+        data_sensor["co_mq7"] = None
+        logging.info(
+            f"[A2] Histori belum cukup untuk forecast — pakai "
+            f"pembacaan sensor apa adanya ({hitung_total()}/{TIMESTEP})"
+        )
+        return data_sensor, None, False
+
+    hasil_prediksi_baru     = generate_prediksi_simulasi(buffer, state.prob_defor, svm)
+    state.prediksi_terakhir = hasil_prediksi_baru
+
+    target_h1  = {f: hasil_prediksi_baru["prediksi_nilai"][f][0] for f in _FITUR_WALK}
+    data_final = generate_data_simulasi(data_sensor, target_h1)
+
+    data_final["tinggi_air"] = 0
+    data_final["co_mq7"]     = None
+    data_final["curah_hujan"] = data_sensor.get("curah_hujan")   # DATA REAL sensor hujan, apa adanya
+    data_final["sumber"]     = "simulasi"
+    data_final["timestamp"]  = datetime.now().isoformat()
+
+    logging.info("[A2] Data A2 dihitung dari forecast + pembacaan A1 (sensor real/dummy)")
+    return data_final, hasil_prediksi_baru, True
+
+
+# ═══════════════════════════════════════════════════════════════════
+# STATUS SENSOR AKTUAL (BARU) — panel terminal untuk cek berkala
+# ═══════════════════════════════════════════════════════════════════
+# HANYA TAMPILAN (+ catatan log saat status berubah). Tidak mengubah data
+# yang disimpan ke SQLite maupun yang dikirim ke server. Pembacaan sensor
+# MENTAH disalin di generate_baris_simulasi() sebelum disimulasikan, lalu
+# ditampilkan di sebelah data simulasi (data yang benar-benar dikirim).
+#
+# Status per sensor (dinilai dari nilai yang terbaca, bukan dari hardware):
+#   OK        semua nilai sensor terbaca
+#   SEBAGIAN  sebagian nilai terbaca (khusus PMS5003T: PM1.0/PM2.5/PM10)
+#   GAGAL     tidak ada nilai yang terbaca (None) — mis. sensor kecabut
+#   DUMMY     MODE_DUMMY aktif -> data bukan dari sensor fisik
+
+_SENSOR_AKTUAL  = {}   # salinan pembacaan sensor mentah siklus terakhir
+_STATUS_SENSOR  = {}   # nama sensor -> status siklus terakhir
+_GAGAL_BERTURUT = {}   # nama sensor -> jumlah siklus berturut-turut gagal/sebagian
+
+# (nama sensor, [(fitur, label, satuan), ...])
+_PANEL_SENSOR = [
+    ("DS18B20",  [("suhu", "suhu", "°C")]),
+    ("SHT31",    [("kelembapan", "kelembapan", "%RH")]),
+    ("PMS5003T", [("pm1_0", "PM1.0", "µg/m³"),
+                  ("pm2_5", "PM2.5", "µg/m³"),
+                  ("pm10",  "PM10",  "µg/m³")]),
+]
+
+
+def _catat_sensor_aktual(data_sensor):
+    """Salin pembacaan sensor mentah + hitung status tiap sensor. Tidak pernah melempar error."""
+    try:
+        data = dict(data_sensor) if data_sensor else {}
+        _SENSOR_AKTUAL.clear()
+        _SENSOR_AKTUAL.update(data)
+        dummy = data.get("sumber") == "dummy"
+
+        for nama, daftar in _PANEL_SENSOR:
+            terbaca = [data.get(fitur) is not None for fitur, _, _ in daftar]
+            if dummy:
+                status = "DUMMY"
+            elif all(terbaca):
+                status = "OK"
+            elif any(terbaca):
+                status = "SEBAGIAN"
+            else:
+                status = "GAGAL"
+
+            if status in ("GAGAL", "SEBAGIAN"):
+                _GAGAL_BERTURUT[nama] = _GAGAL_BERTURUT.get(nama, 0) + 1
+            else:
+                _GAGAL_BERTURUT[nama] = 0
+
+            sebelumnya = _STATUS_SENSOR.get(nama)
+            if sebelumnya is not None and sebelumnya != status:
+                logging.warning(f"[SENSOR] {nama}: status berubah {sebelumnya} -> {status}")
+            _STATUS_SENSOR[nama] = status
+    except Exception as e:
+        logging.error(f"[SENSOR] Gagal mencatat status sensor: {e}")
+
+
+def _tampilkan_panel_sensor(data_simulasi):
+    """Tampilkan status sensor + data A1 berdampingan dengan data A2. Tidak pernah melempar error."""
+    try:
+        warna_status = {"OK": HIJAU, "SEBAGIAN": KUNING, "GAGAL": MERAH2, "DUMMY": KUNING}
+        ada_tanda    = False
+
+        print(f"\n    {BOLD}STATUS SENSOR{RESET}  "
+              f"{ABU}(A1 = pembacaan sensor | A2 = data yang disimpan/dikirim){RESET}")
+        print(f"    {'Sensor':<10}{'Status':<10}{'Data':<12}{'A1':>17}{'A2':>11}{'Selisih':>10}")
+
+        for nama, daftar in _PANEL_SENSOR:
+            status = _STATUS_SENSOR.get(nama, "?")
+            warna  = warna_status.get(status, RESET)
+            for i, (fitur, label, satuan) in enumerate(daftar):
+                aktual = _SENSOR_AKTUAL.get(fitur)
+                sim    = data_simulasi.get(fitur) if data_simulasi else None
+
+                txt_aktual = f"{aktual} {satuan}" if aktual is not None else "tidak terbaca"
+                txt_sim    = "-" if sim is None else str(sim)
+                if aktual is None and sim is not None:
+                    txt_sim  += "*"      # nilai simulasi diisi forecast karena sensor tidak terbaca
+                    ada_tanda = True
+                if aktual is not None and sim is not None:
+                    txt_selisih = f"{sim - aktual:+.2f}"
+                else:
+                    txt_selisih = "-"
+
+                kolom_nama   = f"{nama:<10}" if i == 0 else " " * 10
+                kolom_status = f"{warna}{BOLD}{status:<10}{RESET}" if i == 0 else " " * 10
+                print(f"    {kolom_nama}{kolom_status}{label:<12}{txt_aktual:>17}{txt_sim:>11}{txt_selisih:>10}")
+
+        for nama, _ in _PANEL_SENSOR:
+            n = _GAGAL_BERTURUT.get(nama, 0)
+            if n > 0:
+                print(f"    {MERAH}⚠ {nama} bermasalah (tidak terbaca) selama {n} siklus berturut-turut — cek kabel/sensor{RESET}")
+        if ada_tanda:
+            print(f"    {ABU}* nilai A2 diisi dari forecast karena sensor tidak terbaca{RESET}")
+        if any(v == "DUMMY" for v in _STATUS_SENSOR.values()):
+            print(f"    {ABU}MODE_DUMMY aktif: nilai 'A1' berasal dari generator dummy, bukan sensor fisik{RESET}")
+    except Exception as e:
+        logging.error(f"[SENSOR] Gagal menampilkan panel sensor: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# TAMPILAN TERMINAL MODE SIMULASI
+# ═══════════════════════════════════════════════════════════════════
+
+def _tampilkan_banner():
+    print(f"\n{BOLD}{MERAH2}{'='*54}{RESET}")
+    print(f"{BOLD}{MERAH2}              MODE A2 AKTIF{RESET}")
+    print(f"{BOLD}{MERAH2}        DATA HANYA UNTUK TESTING/DEMO WEB{RESET}")
+    print(f"{BOLD}{MERAH2}{'='*54}{RESET}\n")
+
+
+def _tampilkan_siklus_simulasi(no, data, hasil_svm, batch_baru_dibuat,
+                                hasil_kebakaran=None, hasil_banjir=None, hasil_pencemaran=None,
+                                hasil_hujan=None):
+    waktu = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kelas = hasil_svm.get("status", "?") if hasil_svm else "?"
+    warna = WARNA_RISIKO.get(kelas, RESET)
+    conf  = hasil_svm.get("confidence", 0) if hasil_svm else 0
+
+    print(f"\n  {'-'*58}")
+    print(f"  {CYAN}[A2] #{no:<4}{RESET}  {waktu}")
+    print(f"  {'-'*58}")
+    print(f"    suhu={data.get('suhu')}  RH={data.get('kelembapan')}  "
+          f"PM1.0={data.get('pm1_0')}  PM2.5={data.get('pm2_5')}  PM10={data.get('pm10')}  "
+          f"tinggi_air={data.get('tinggi_air')}")
+    print(f"    Utama : {warna}{BOLD}{kelas}{RESET}  confidence {conf:.1f}%  "
+          f"{ABU}(sumber data: A2){RESET}")
+    if batch_baru_dibuat:
+        print(f"    {KUNING}[A2] {SIMULASI_HORIZON} horizon prediksi baru dibuat "
+              f"(generator sintetis, BUKAN LSTM){RESET}")
+
+    for label, hasil in [("Kebakaran", hasil_kebakaran),
+                          ("Banjir", hasil_banjir),
+                          ("Pencemaran Udara", hasil_pencemaran)]:
+        if hasil:
+            k = hasil.get("status", "?")
+            w = WARNA_RISIKO.get(k, RESET)
+            c = hasil.get("confidence", 0)
+            print(f"    {label:<18}: {w}{BOLD}{k}{RESET}  confidence {c:.1f}%")
+
+    ch = data.get("curah_hujan")
+    if ch is not None and hasil_hujan:
+        k  = hasil_hujan.get("status", "?")
+        pk = hasil_hujan.get("prediksi_status", "?")
+        print(f"    {'Curah Hujan':<18}: {WARNA_RISIKO.get(k, RESET)}{BOLD}{k}{RESET}  {ch} mm/jam ({'data A1' if HUJAN_STATE['baca'] else 'sensor OFF, default 0'})  "
+              f"confidence {hasil_hujan.get('confidence', 0):.1f}%")
+        print(f"    {'  prediksi hujan':<18}: {hasil_hujan.get('prediksi_nilai')} mm/jam  "
+              f"{WARNA_RISIKO.get(pk, RESET)}{pk}{RESET}")
+    else:
+        print(f"    {'Curah Hujan':<18}: {KUNING}tidak tersedia{RESET}")
+
+    _tampilkan_panel_sensor(data)   # BARU: status sensor + data aktual di sebelah data simulasi
+
+
+# ═══════════════════════════════════════════════════════════════════
+# LOOP UTAMA MODE SIMULASI — dipanggil dari main.py
+# ═══════════════════════════════════════════════════════════════════
+
+def jalankan_mode_simulasi(demo=False):
+    """
+    Loop utama mode --simulasi. Mirip alur main.py, tapi:
+      - "Data aktual" yang disimpan/dikirim adalah "data simulasi" (forecast
+        yang ditarik ke arah pembacaan sensor real/dummy siklus ini) —
+        bukan pembacaan sensor langsung TANPA penyesuaian.
+      - TIDAK memakai PrediksiLSTM / model_lstm.tflite sama sekali; forecast
+        dihasilkan generator sintetis (generate_prediksi_simulasi).
+      - PrediksiSVM asli tetap dipakai untuk klasifikasi risiko.
+      - Tetap memakai database.py & kirim_data.py apa adanya, supaya
+        website menerima data dengan format yang sama seperti mode normal.
+      - HANYA independen untuk predikta.site (satu server, satu jalur).
+    """
+    _tampilkan_banner()
+    logging.info("[A2] Mode A2 diaktifkan (python main.py --simulasi)")
+
+    init_db()
+    print(f"  {HIJAU}✓{RESET} Database SQLite siap (mode A2)")
+
+    print(f"  Menyiapkan klasifikasi utama (skor tertimbang)...", end=" ", flush=True)
+    svm = KlasifikasiUtama()   # klasifikasi utama (status risiko gabungan) — pengganti SVM umum
+    svm_kebakaran  = buat_svm_kebakaran()
+    svm_banjir     = buat_svm_banjir()
+    svm_pencemaran = buat_svm_pencemaran()
+    print(f"{HIJAU}OK{RESET}")
+    print(f"  {ABU}(PrediksiLSTM TIDAK dimuat pada mode A2 — sesuai desain){RESET}")
+
+    data_defor = ambil_deforestasi_fixed()
+    prob_defor = data_defor.get("prob_deforestasi")
+    if prob_defor is None:
+        prob_defor = 0.317
+    print(f"  {HIJAU}✓{RESET} prob_deforestasi (fixed, dari deforestasi.json) = {prob_defor}")
+    print(f"  {HIJAU}✓{RESET} Mode A2 independen predikta.site — baca sensor dulu, baru disimulasikan")
+
+    if demo:
+        print(f"  {KUNING}Mode demo — satu siklus saja{RESET}")
+
+    print(f"\n  Memulai loop A2... (Ctrl+C untuk berhenti)\n")
+
+    state       = _StateSimulasi(prob_defor)
+    no          = 0
+    waktu_kirim = time.time()
+
+    try:
+        while True:
+            no += 1
+
+            data_sensor, hasil_prediksi_untuk_disimpan, batch_baru_dibuat = \
+                generate_baris_simulasi(state, svm)
+
+            if data_sensor is None:
+                print(f"  {KUNING}[A2 #{no}] Semua sensor inti gagal — lewati{RESET}")
+                time.sleep(INTERVAL_BACA)
+                continue
+
+            # Klasifikasi risiko SAAT INI (baris ini) via SVM asli
+            hasil_svm = svm.prediksi(data_sensor, prob_defor)
+
+            # Klasifikasi PER BENCANA — SVM asli per jenis bencana, dari
+            # data_sensor yang sama (tinggi_air selalu 0, lihat docstring modul).
+            hasil_kebakaran  = svm_kebakaran.prediksi(data_sensor)
+            hasil_banjir     = svm_banjir.prediksi(data_sensor)
+            hasil_pencemaran = svm_pencemaran.prediksi(data_sensor)
+
+            # Curah hujan — DATA REAL sensor (tidak disimulasikan); klasifikasi threshold,
+            # confidence & prediksi acak.
+            hasil_hujan = analisis_hujan(data_sensor.get("curah_hujan"))
+
+            # Pipeline "prediksi -> SVM" untuk T+1, memakai horizon pertama
+            # dari forecast simulasi yang BARU SAJA dihitung fresh siklus ini.
+            hasil_prediksi_risiko = None
+            if hasil_prediksi_untuk_disimpan:
+                try:
+                    pred_t1 = {f: hasil_prediksi_untuk_disimpan["prediksi_nilai"][f][0] for f in _FITUR_WALK}
+                    pred_t1["tinggi_air"] = 0
+                    hasil_prediksi_risiko = svm.prediksi(pred_t1, prob_defor)
+                except Exception as e:
+                    logging.error(f"[A2] Gagal buat prediksi_risiko: {e}")
+
+            # Simpan ke SQLite (histori lokal) — memakai database.py apa adanya.
+            row_id = simpan_data(data_sensor, hasil_svm or {}, hasil_prediksi_untuk_disimpan,
+                                  data_defor, hasil_prediksi_risiko,
+                                  hasil_kebakaran, hasil_banjir, hasil_pencemaran,
+                                  hasil_hujan=hasil_hujan)
+
+            # Tambahkan ke antrian JSON — independen untuk predikta.site saja.
+            tambah_antrian(data_sensor, hasil_svm or {}, hasil_prediksi_untuk_disimpan,
+                            data_defor, hasil_prediksi_risiko, row_id=row_id,
+                            hasil_kebakaran=hasil_kebakaran, hasil_banjir=hasil_banjir,
+                            hasil_pencemaran=hasil_pencemaran, hasil_hujan=hasil_hujan)
+
+            _tampilkan_siklus_simulasi(no, data_sensor, hasil_svm, batch_baru_dibuat,
+                                        hasil_kebakaran, hasil_banjir, hasil_pencemaran, hasil_hujan)
+
+            # Kirim ke server sesuai interval — memakai kirim_data.py apa adanya
+            if time.time() - waktu_kirim >= INTERVAL_KIRIM:
+                print(f"  {ABU}[A2] Mengirim data ke server...{RESET}", end=" ", flush=True)
+                logging.info("[A2] Mengirim data ke server")
+                proses_pengiriman()
+                print(f"{HIJAU}selesai{RESET}")
+                waktu_kirim = time.time()
+
+            if demo:
+                print(f"\n  {HIJAU}[A2] Demo selesai.{RESET}\n")
+                break
+
+            time.sleep(INTERVAL_BACA)
+
+    except KeyboardInterrupt:
+        print(f"\n\n  {KUNING}[A2] Dihentikan.{RESET}")
+        logging.info("[A2] Dihentikan oleh pengguna.")
+    finally:
+        print(f"  Total data tersimpan (termasuk data A2): {hitung_total()}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# DBS (dbs.py) — cek struktur tabel sensor_log
+# ═══════════════════════════════════════════════════════════════════
+
+def jalankan_dbs():
+    conn = sqlite3.connect('data/predikta.db')
+    c = conn.cursor()
+    c.execute('PRAGMA table_info(sensor_log)')
+    for row in c.fetchall():
+        print(row)
+    conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# ENTRY: blok __main__ dari prediksi_cnn_setup.py
+# ═══════════════════════════════════════════════════════════════════
+
+def jalankan_setup_cnn():
+    global Image
+    from PIL import Image   # import level-modul asli prediksi_cnn_setup.py
+    warnings.filterwarnings("ignore")
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+    parser = argparse.ArgumentParser(
+        description="Setup CNN deforestasi di RPi — jalankan sekali saat instalasi"
+    )
+    parser.add_argument("--gambar", "-g", type=str,
+                        help="Path gambar PNG/JPG area lokasi alat")
+    parser.add_argument("--preview", action="store_true",
+                        help="Tampilkan isi deforestasi.json yang sudah ada")
+    args = parser.parse_args()
+
+    print(f"\n{BOLD}{'═'*55}{RESET}")
+    print(f"  {BOLD}SETUP CNN DEFORESTASI — RASPBERRY PI{RESET}")
+    print(f"  Jalankan sekali saat instalasi alat di lapangan")
+    print(f"{BOLD}{'═'*55}{RESET}\n")
+
+    if args.preview:
+        cek_existing()
+        sys.exit(0)
+
+    if not args.gambar:
+        print(f"  {KUNING}Gunakan --gambar untuk memproses foto lahan.{RESET}")
+        print(f"  Contoh: python prediksi_cnn_setup.py --gambar foto.png")
+        print(f"\n  Atau --preview untuk melihat hasil yang sudah ada:")
+        print(f"  python prediksi_cnn_setup.py --preview")
+        cek_existing()
+        sys.exit(0)
+
+    # Cek apakah sudah ada hasil sebelumnya
+    if os.path.exists(DEFOR_PATH):
+        print(f"  {KUNING}⚠ deforestasi.json sudah ada.{RESET}")
+        cek_existing()
+        print(f"\n  Lanjutkan dan timpa dengan data baru? (y/n): ", end="")
+        if input().strip().lower() != "y":
+            print("  Dibatalkan.\n")
+            sys.exit(0)
+
+    # Load model dan proses gambar
+    interp, inp_det, out_det = load_interpreter()
+    batch, ukuran            = preprocessing(args.gambar)
+    prob_forest, prob_defor  = inferensi(interp, inp_det, out_det, batch)
+    kelas                    = "forest" if prob_forest >= 0.5 else "deforestation"
+    status                   = tentukan_status(prob_defor)
+
+    tampilkan_hasil(args.gambar, ukuran, kelas, prob_defor, prob_forest, status)
+    simpan_hasil(args.gambar, kelas, prob_defor, prob_forest, status)
+
+    print(f"\n{BOLD}{'═'*55}{RESET}")
+    print(f"  {HIJAU}Setup selesai!{RESET}")
+    print(f"  Jalankan sistem utama: python main.py")
+    print(f"{BOLD}{'═'*55}{RESET}\n")
+
+
+if __name__ == "__main__":
+    if "--dbs" in sys.argv:
+        jalankan_dbs()
+    elif any(a in sys.argv for a in ("--gambar", "-g", "--preview")):
+        jalankan_setup_cnn()
+    else:
+        # Jalan terus sampai dihentikan (Ctrl+C / tombol Stop di Thonny).
+        jalankan_mode_simulasi()
+        # Untuk tes cepat satu siklus saja, ganti baris di atas dengan:
+        # jalankan_mode_simulasi(demo=True)
