@@ -6,8 +6,13 @@ main.py (mode simulasi terbaru), prediksi_cnn_setup.py, dan dbs.py.
 Isi fungsi/kelas TIDAK diubah dari file aslinya.
 PENGECUALIAN: panel STATUS SENSOR (DS18B20, SHT31, PMS5003T) ditambahkan atas permintaan —
 hanya tampilan terminal + log; data yang disimpan/dikirim tidak berubah.
-PERUBAHAN TERBARU (simulasi PM): batas bawah PM = 0, batas atas PM = 150 masing-masing,
+PERUBAHAN SIMULASI PM: batas bawah PM = 0, batas atas PM = 150 masing-masing,
 dan urutan PM1.0 < PM2.5 < PM10 selalu dipaksa (lihat _paksa_urutan_pm).
+PERUBAHAN TERBARU (PMS5003T tanpa sensor nyata): PM digenerate lewat PM2.5 sebagai
+satu-satunya penggerak, PM1.0 & PM10 diturunkan dari PM2.5 dengan rasio yang bergeser
+pelan, sehingga ketiganya tidak lagi saling berdekatan (lihat _generate_pm_tanpa_sensor,
+_paksa_urutan_pm, generate_prediksi_simulasi, generate_data_simulasi).
+Saklar: PMS_SIMULASI_TANPA_SENSOR (True = PM digenerate, False = pakai sensor PMS5003T).
 
 Menjalankan:
   python predikta.py                       -> sama seperti menjalankan main.py yang diunggah
@@ -2630,6 +2635,9 @@ def cek_existing():
 #   1. BACA SENSOR DULU — baca_sensor() dipanggil di awal setiap siklus,
 #      memakai jalur yang SAMA dengan mode normal (MODE_DUMMY menentukan
 #      dummy vs sensor fisik). Ini "data sensor" apa adanya untuk siklus ini.
+#      (Khusus PM: kalau PMS_SIMULASI_TANPA_SENSOR=True, nilai PM1.0/PM2.5/PM10
+#      di langkah ini DIGENERATE oleh _generate_pm_tanpa_sensor(), bukan dibaca
+#      dari PMS5003T.)
 #
 #   2. Kalau histori SQLite (via ambil_buffer_lstm) BELUM cukup TIMESTEP
 #      baris, "data sensor" hasil baca_sensor() dipakai APA ADANYA sebagai
@@ -2670,8 +2678,8 @@ def cek_existing():
 #                       TIDAK ditarik ke arah forecast & TIDAK disimulasikan. Klasifikasi =
 #                       threshold biasa; confidence & prediksi acak (prediksi.analisis_hujan)
 #
-# Batas PM (revisi terbaru): PM1.0, PM2.5, PM10 masing-masing 0..150 µg/m³ dan
-# SELALU berurutan PM1.0 < PM2.5 < PM10 (lihat _paksa_urutan_pm).
+# Batas PM: PM1.0, PM2.5, PM10 masing-masing 0..150 µg/m³ dan SELALU berurutan
+# PM1.0 < PM2.5 < PM10 dengan jarak PROPORSIONAL (lihat _paksa_urutan_pm).
 #
 
 
@@ -2746,22 +2754,90 @@ def _bulatkan(fitur, nilai):
     return round(nilai, 2)
 
 
+# ═══════════════════════════════════════════════════════════════════
+# PM: URUTAN & JARAK PROPORSIONAL
+# ═══════════════════════════════════════════════════════════════════
 PM_MAKS = 150
+PM_RASIO_PM1_MAKS = 0.85   # PM1.0 maksimal 85% dari PM2.5
+PM_RASIO_PM10_MIN = 1.15   # PM10 minimal 115% dari PM2.5
 
 
 def _paksa_urutan_pm(d):
     """
-    Pastikan pm1_0 < pm2_5 < pm10 dan semuanya <= PM_MAKS (150).
-    Bekerja in-place pada dict, hasilnya bilangan bulat.
-    Selisih minimal antar-PM = 1 µg/m³ (syarat '<' murni).
+    Pastikan pm1_0 < pm2_5 < pm10, semuanya 0..PM_MAKS (150).
+    Selisih minimal PROPORSIONAL (bukan sekadar +1), jadi tidak menumpuk
+    di 148/149/150 atau 1/2/3. Nilai yang sudah renggang tidak diubah.
+    In-place, hasilnya bilangan bulat.
     """
     if not all(k in d and d[k] is not None for k in ("pm1_0", "pm2_5", "pm10")):
         return d
-    pm1  = int(max(0, min(PM_MAKS - 2, round(d["pm1_0"]))))
-    pm25 = int(max(pm1 + 1, min(PM_MAKS - 1, round(d["pm2_5"]))))
-    pm10 = int(max(pm25 + 1, min(PM_MAKS, round(d["pm10"]))))
+    pm25 = int(max(2, min(round(d["pm2_5"]), int(PM_MAKS / PM_RASIO_PM10_MIN))))
+    pm1  = int(max(0, min(round(d["pm1_0"]), int(pm25 * PM_RASIO_PM1_MAKS))))
+    pm10 = int(min(PM_MAKS, max(round(d["pm10"]),
+                                math.ceil(pm25 * PM_RASIO_PM10_MIN),
+                                pm25 + 1)))
     d["pm1_0"], d["pm2_5"], d["pm10"] = pm1, pm25, pm10
     return d
+
+
+# ═══════════════════════════════════════════════════════════════════
+# GENERATOR PM (PMS5003T) TANPA SENSOR FISIK
+# ═══════════════════════════════════════════════════════════════════
+# True  -> PM digenerate (pembacaan PMS5003T diabaikan/tidak dipakai)
+# False -> pakai pembacaan sensor seperti semula
+PMS_SIMULASI_TANPA_SENSOR = True
+PM25_SIM_MAKS = 115          # supaya PM10 (>= 1.15x) tetap muat di bawah 150
+
+_PM_ZONES = [                # (min, max, bobot) target PM2.5
+    (5,   25,  0.30),
+    (25,  55,  0.35),
+    (55,  90,  0.25),
+    (90,  115, 0.10),
+]
+
+_pm_sim_state = {"pm25": 30.0, "target": 30.0, "hitungan": 0,
+                 "r1": 0.65, "r10": 1.6}
+
+
+def _pilih_target_pm25():
+    """Pilih satu target PM2.5 acak dari salah satu zona (berbobot)."""
+    r, kum = random.random(), 0.0
+    for lo, hi, p in _PM_ZONES:
+        kum += p
+        if r <= kum:
+            return random.uniform(lo, hi)
+    lo, hi, _ = _PM_ZONES[-1]
+    return random.uniform(lo, hi)
+
+
+def _generate_pm_tanpa_sensor():
+    """
+    Generate PM1.0/PM2.5/PM10 tanpa PMS5003T.
+    - PM2.5 bergerak halus menuju target zona, sesekali lonjakan NAIK, turun selalu bertahap.
+    - PM1.0 & PM10 = PM2.5 x rasio (rasio ikut bergeser pelan) -> selisihnya
+      bervariasi dan realistis, tidak menempel satu sama lain.
+    """
+    s = _pm_sim_state
+    if s["hitungan"] <= 0:
+        s["target"]   = _pilih_target_pm25()
+        s["hitungan"] = random.randint(10, 30)
+    else:
+        s["hitungan"] -= 1
+
+    if random.random() < 0.02:                       # lonjakan naik mendadak (jarang)
+        s["pm25"] += random.uniform(10, 30)
+    else:
+        langkah = (s["target"] - s["pm25"]) * 0.25 + random.gauss(0, 1.5)
+        s["pm25"] += max(-8.0, min(8.0, langkah))
+    s["pm25"] = max(2.0, min(PM25_SIM_MAKS, s["pm25"]))
+
+    s["r1"]  = max(0.45, min(0.80, s["r1"]  + random.gauss(0, 0.03)))
+    s["r10"] = max(1.30, min(2.20, s["r10"] + random.gauss(0, 0.08)))
+
+    d = {"pm2_5": s["pm25"],
+         "pm1_0": s["pm25"] * s["r1"],
+         "pm10" : min(PM_MAKS, s["pm25"] * s["r10"])}
+    return _paksa_urutan_pm(d)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2863,6 +2939,21 @@ class _StateSimulasi:
 # FORECAST SINTETIS (bukan LSTM)
 # ═══════════════════════════════════════════════════════════════════
 
+def _nilai_buffer(row, fitur):
+    """Ambil nilai dari baris buffer; aman terhadap None (mis. PM kosong di histori lama)."""
+    v = row.get(fitur)
+    return v if v is not None else _NILAI_AWAL[fitur]
+
+
+def _rasio_pm(row):
+    """Hitung rasio PM1.0/PM2.5 dan PM10/PM2.5 dari satu baris buffer (dibatasi wajar)."""
+    pm1, pm25, pm10 = row.get("pm1_0"), row.get("pm2_5"), row.get("pm10")
+    if not pm25 or pm25 <= 0 or pm1 is None or pm10 is None:
+        return 0.65, 1.6
+    return (max(0.45, min(0.80, pm1 / pm25)),
+            max(1.30, min(2.20, pm10 / pm25)))
+
+
 def generate_prediksi_simulasi(buffer_terakhir, prob_defor, svm: "KlasifikasiUtama"):
     """
     Buat struktur prediksi sintetis semirip mungkin dengan output
@@ -2871,47 +2962,59 @@ def generate_prediksi_simulasi(buffer_terakhir, prob_defor, svm: "KlasifikasiUta
         {"prediksi_nilai": {fitur: [...]}, "prediksi_status": [...]}
 
     Melanjutkan tren linier dari buffer_terakhir (TIMESTEP baris terakhir
-    dari SQLite — histori ini sekarang berasal dari "data simulasi" yang
-    sudah ditarik ke arah sensor real/dummy tiap siklus, lihat
-    generate_data_simulasi()), dengan variasi kecil tiap horizon (tidak ada
-    lonjakan ekstrem). tinggi_air & prob_deforestasi FIXED. Status/confidence
-    per horizon diperoleh dari PrediksiSVM ASLI (bukan angka karangan).
+    dari SQLite), dengan variasi kecil tiap horizon (tidak ada lonjakan
+    ekstrem). Yang di-walk HANYA suhu, kelembapan, dan PM2.5; PM1.0 & PM10
+    diturunkan dari PM2.5 lewat rasio yang bergeser pelan, sehingga ketiga
+    PM tidak saling menempel. tinggi_air & prob_deforestasi FIXED.
+    Status/confidence per horizon diperoleh dari klasifikasi ASLI (bukan
+    angka karangan).
     """
+    fitur_jalan    = ["suhu", "kelembapan", "pm2_5"]
     prediksi_nilai = {f: [] for f in _FITUR_WALK}
     prediksi_nilai["tinggi_air"] = [0] * SIMULASI_HORIZON
 
     # Estimasi tren per fitur dari 2 baris terakhir buffer (kalau tersedia).
     tren = {}
-    for fitur in _FITUR_WALK:
+    for fitur in fitur_jalan:
         if len(buffer_terakhir) >= 2:
-            delta = buffer_terakhir[-1].get(fitur, 0) - buffer_terakhir[-2].get(fitur, 0)
+            delta = _nilai_buffer(buffer_terakhir[-1], fitur) - \
+                    _nilai_buffer(buffer_terakhir[-2], fitur)
         else:
             delta = 0.0
         batas_t = _BATAS_TREN.get(fitur, 5)
         tren[fitur] = max(-batas_t, min(batas_t, delta))
 
-    titik = {f: buffer_terakhir[-1].get(f, _NILAI_AWAL[f]) for f in _FITUR_WALK}
+    titik   = {f: _nilai_buffer(buffer_terakhir[-1], f) for f in fitur_jalan}
+    r1, r10 = _rasio_pm(buffer_terakhir[-1])
 
     prediksi_status = []
     for h in range(SIMULASI_HORIZON):
-        for fitur in _FITUR_WALK:
-            skala_noise = 6.0 if fitur in ("pm1_0", "pm2_5", "pm10") else 1.0
+        for fitur in fitur_jalan:
+            skala_noise = 6.0 if fitur == "pm2_5" else 1.0
             # Tarikan balik ringan ke titik tengah (_NILAI_AWAL) — mencegah
             # tren terus membesar/menurun tanpa batas antar-batch (mean-reversion).
             tarik_kembali = (_NILAI_AWAL[fitur] - titik[fitur]) * 0.08
             titik[fitur]  = titik[fitur] + tren[fitur] * 0.6 + tarik_kembali \
                             + random.gauss(0, 0.05) * skala_noise
             titik[fitur]  = _clamp(fitur, titik[fitur])
-            prediksi_nilai[fitur].append(_bulatkan(fitur, titik[fitur]))
+        titik["pm2_5"] = min(titik["pm2_5"], PM25_SIM_MAKS)
 
-        # Paksa PM1.0 < PM2.5 < PM10 (maks 150) untuk horizon ini
-        pm = {k: titik[k] for k in ("pm1_0", "pm2_5", "pm10")}
+        # Rasio antar-PM bergeser pelan antar-horizon (bukan acak bebas)
+        r1  = max(0.45, min(0.80, r1  + random.gauss(0, 0.03)))
+        r10 = max(1.30, min(2.20, r10 + random.gauss(0, 0.08)))
+
+        pm = {"pm2_5": titik["pm2_5"],
+              "pm1_0": titik["pm2_5"] * r1,
+              "pm10" : titik["pm2_5"] * r10}
         _paksa_urutan_pm(pm)
-        for k in ("pm1_0", "pm2_5", "pm10"):
-            titik[k] = pm[k]
-            prediksi_nilai[k][-1] = pm[k]
+        titik["pm2_5"] = pm["pm2_5"]
 
-        # Klasifikasi horizon ini pakai SVM asli — confidence TIDAK dikarang manual
+        prediksi_nilai["suhu"].append(_bulatkan("suhu", titik["suhu"]))
+        prediksi_nilai["kelembapan"].append(_bulatkan("kelembapan", titik["kelembapan"]))
+        for k in ("pm1_0", "pm2_5", "pm10"):
+            prediksi_nilai[k].append(pm[k])
+
+        # Klasifikasi horizon ini pakai klasifikasi asli — confidence TIDAK dikarang manual
         titik_svm = {f: prediksi_nilai[f][h] for f in _FITUR_WALK}
         titik_svm["tinggi_air"] = 0
         hasil = svm.prediksi(titik_svm, prob_defor) if svm else None
@@ -2950,8 +3053,10 @@ def generate_data_simulasi(data_sensor_asli: dict, target: dict,
            jadi hasil akhir SELALU berada di antara prediksi & sensor
            (lihat contoh pola di docstring modul).
         5. Hasil akhir tetap di-clamp ke rentang realistis fitur (_BATAS_NILAI).
-        6. (BARU) Setelah semua fitur selesai, PM dipaksa berurutan
-           PM1.0 < PM2.5 < PM10 dan <= 150 lewat _paksa_urutan_pm().
+        6. Setelah semua fitur selesai, PM1.0 & PM10 DISESUAIKAN ulang dari
+           PM2.5 memakai rasio pembacaan sensor siklus ini (PM disimulasikan
+           sebagai satu kelompok, bukan tiga fitur terpisah), lalu dipaksa
+           berurutan PM1.0 < PM2.5 < PM10 dan <= 150 lewat _paksa_urutan_pm().
 
     Return dict {fitur: nilai} MURNI NUMERIK — TIDAK menambahkan field
     non-numerik (tinggi_air, co_mq7, sumber, timestamp); itu tanggung jawab
@@ -2981,6 +3086,16 @@ def generate_data_simulasi(data_sensor_asli: dict, target: dict,
 
         hasil[fitur] = _bulatkan(fitur, _clamp(fitur, nilai_baru, batas_dict))
 
+    # PM: jaga rasio antar-PM mengikuti pembacaan sensor siklus ini, supaya
+    # ditarik terpisah pun hasilnya tidak saling menempel / bertabrakan.
+    pm_s = [data_sensor_asli.get(k) for k in ("pm1_0", "pm2_5", "pm10")]
+    if all(k in hasil for k in ("pm1_0", "pm2_5", "pm10")) \
+            and all(v is not None for v in pm_s) and pm_s[1] > 0:
+        r1  = max(0.40, min(0.85, pm_s[0] / pm_s[1]))
+        r10 = max(1.20, min(2.50, pm_s[2] / pm_s[1]))
+        hasil["pm1_0"] = round(hasil["pm2_5"] * r1)
+        hasil["pm10"]  = round(hasil["pm2_5"] * r10)
+
     _paksa_urutan_pm(hasil)
     return hasil
 
@@ -2997,7 +3112,8 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
     modul ini):
       1. baca_sensor() dipanggil LEBIH DULU — data sensor real/dummy siklus
          ini (bisa None kalau semua sensor inti gagal di mode nyata, sama
-         seperti main.py).
+         seperti main.py). Kalau PMS_SIMULASI_TANPA_SENSOR=True, PM digenerate
+         oleh _generate_pm_tanpa_sensor() menggantikan pembacaan PMS5003T.
       2. Kalau histori SQLite belum cukup TIMESTEP baris -> laporkan
          pembacaan sensor apa adanya (belum ada forecast pembanding).
       3. Kalau sudah cukup -> hitung forecast fresh (generate_prediksi_
@@ -3009,7 +3125,9 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
                     dilewati oleh caller, sama seperti main.py).
     """
     data_sensor = baca_sensor()
-    _catat_sensor_aktual(data_sensor)   # BARU: hanya untuk panel status sensor (tidak memengaruhi data)
+    if data_sensor is not None and PMS_SIMULASI_TANPA_SENSOR:
+        data_sensor.update(_generate_pm_tanpa_sensor())   # PM digenerate, PMS5003T tidak dipakai
+    _catat_sensor_aktual(data_sensor)   # hanya untuk panel status sensor (tidak memengaruhi data)
     if data_sensor is None:
         return None, None, False
 
@@ -3056,6 +3174,7 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
 #   SEBAGIAN  sebagian nilai terbaca (khusus PMS5003T: PM1.0/PM2.5/PM10)
 #   GAGAL     tidak ada nilai yang terbaca (None) — mis. sensor kecabut
 #   DUMMY     MODE_DUMMY aktif -> data bukan dari sensor fisik
+#   SIMULASI  PMS5003T tanpa sensor fisik, PM digenerate (PMS_SIMULASI_TANPA_SENSOR)
 
 _SENSOR_AKTUAL  = {}   # salinan pembacaan sensor mentah siklus terakhir
 _STATUS_SENSOR  = {}   # nama sensor -> status siklus terakhir
@@ -3083,6 +3202,8 @@ def _catat_sensor_aktual(data_sensor):
             terbaca = [data.get(fitur) is not None for fitur, _, _ in daftar]
             if dummy:
                 status = "DUMMY"
+            elif nama == "PMS5003T" and PMS_SIMULASI_TANPA_SENSOR:
+                status = "SIMULASI"          # bukan error, memang digenerate
             elif all(terbaca):
                 status = "OK"
             elif any(terbaca):
@@ -3106,7 +3227,8 @@ def _catat_sensor_aktual(data_sensor):
 def _tampilkan_panel_sensor(data_simulasi):
     """Tampilkan status sensor + data A1 berdampingan dengan data A2. Tidak pernah melempar error."""
     try:
-        warna_status = {"OK": HIJAU, "SEBAGIAN": KUNING, "GAGAL": MERAH2, "DUMMY": KUNING}
+        warna_status = {"OK": HIJAU, "SEBAGIAN": KUNING, "GAGAL": MERAH2,
+                        "DUMMY": KUNING, "SIMULASI": CYAN}
         ada_tanda    = False
 
         print(f"\n    {BOLD}STATUS SENSOR{RESET}  "
@@ -3142,6 +3264,8 @@ def _tampilkan_panel_sensor(data_simulasi):
             print(f"    {ABU}* nilai A2 diisi dari forecast karena sensor tidak terbaca{RESET}")
         if any(v == "DUMMY" for v in _STATUS_SENSOR.values()):
             print(f"    {ABU}MODE_DUMMY aktif: nilai 'A1' berasal dari generator dummy, bukan sensor fisik{RESET}")
+        if _STATUS_SENSOR.get("PMS5003T") == "SIMULASI":
+            print(f"    {ABU}PMS5003T: tanpa sensor fisik, nilai PM 'A1' digenerate (PMS_SIMULASI_TANPA_SENSOR=True){RESET}")
     except Exception as e:
         logging.error(f"[SENSOR] Gagal menampilkan panel sensor: {e}")
 
@@ -3197,7 +3321,7 @@ def _tampilkan_siklus_simulasi(no, data, hasil_svm, batch_baru_dibuat,
     else:
         print(f"    {'Curah Hujan':<18}: {KUNING}tidak tersedia{RESET}")
 
-    _tampilkan_panel_sensor(data)   # BARU: status sensor + data aktual di sebelah data simulasi
+    _tampilkan_panel_sensor(data)   # status sensor + data aktual di sebelah data simulasi
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -3237,6 +3361,8 @@ def jalankan_mode_simulasi(demo=False):
         prob_defor = 0.317
     print(f"  {HIJAU}✓{RESET} prob_deforestasi (fixed, dari deforestasi.json) = {prob_defor}")
     print(f"  {HIJAU}✓{RESET} Mode A2 independen predikta.site — baca sensor dulu, baru disimulasikan")
+    if PMS_SIMULASI_TANPA_SENSOR:
+        print(f"  {HIJAU}✓{RESET} PMS5003T: PM digenerate tanpa sensor fisik (PM2.5 sebagai penggerak, PM1.0/PM10 via rasio)")
 
     if demo:
         print(f"  {KUNING}Mode demo — satu siklus saja{RESET}")
