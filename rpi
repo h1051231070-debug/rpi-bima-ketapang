@@ -2703,9 +2703,9 @@ _FITUR_WALK = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10"]
 _NILAI_AWAL = {
     "suhu"       : 33.12,
     "kelembapan" : 58.90,
-    "pm1_0"      : 40,
-    "pm2_5"      : 70,
-    "pm10"       : 110,
+    "pm1_0"      : 144,
+    "pm2_5"      : 221,
+    "pm10"       : 354,
 }
 
 # Batas nilai realistis per fitur — dipakai untuk clamp forecast & hasil
@@ -2714,9 +2714,9 @@ _NILAI_AWAL = {
 _BATAS_NILAI = {
     "suhu"       : (20.0, 40.0),
     "kelembapan" : (35.0, 85.0),
-    "pm1_0"      : (0, 150),
-    "pm2_5"      : (0, 150),
-    "pm10"       : (0, 150),
+    "pm1_0"      : (0, 500),
+    "pm2_5"      : (0, 500),
+    "pm10"       : (0, 500),
 }
 
 # Skala deviasi maksimum forecast (sbg fraksi lebar rentang fitur) — dipakai
@@ -2757,7 +2757,7 @@ def _bulatkan(fitur, nilai):
 # ═══════════════════════════════════════════════════════════════════
 # PM: URUTAN & JARAK PROPORSIONAL
 # ═══════════════════════════════════════════════════════════════════
-PM_MAKS = 150
+PM_MAKS = 500              # batas atas mutlak PM (PMS5003T mampu s/d 500 µg/m³)
 PM_RASIO_PM1_MAKS = 0.85   # PM1.0 maksimal 85% dari PM2.5
 PM_RASIO_PM10_MIN = 1.15   # PM10 minimal 115% dari PM2.5
 
@@ -2786,16 +2786,17 @@ def _paksa_urutan_pm(d):
 # True  -> PM digenerate (pembacaan PMS5003T diabaikan/tidak dipakai)
 # False -> pakai pembacaan sensor seperti semula
 PMS_SIMULASI_TANPA_SENSOR = True
-PM25_SIM_MAKS = 115          # supaya PM10 (>= 1.15x) tetap muat di bawah 150
+PM25_SIM_MAKS = 289          # batas atas PM2.5 A1
+PM25_SIM_MIN  = 97           # batas bawah PM2.5 A1
 
 _PM_ZONES = [                # (min, max, bobot) target PM2.5
-    (5,   25,  0.30),
-    (25,  55,  0.35),
-    (55,  90,  0.25),
-    (90,  115, 0.10),
+    (97,  140, 0.30),
+    (140, 200, 0.30),
+    (200, 250, 0.25),
+    (250, 289, 0.15),
 ]
 
-_pm_sim_state = {"pm25": 30.0, "target": 30.0, "hitungan": 0,
+_pm_sim_state = {"pm25": 221.0, "target": 221.0, "hitungan": 0,
                  "r1": 0.65, "r10": 1.6}
 
 
@@ -2829,7 +2830,7 @@ def _generate_pm_tanpa_sensor():
     else:
         langkah = (s["target"] - s["pm25"]) * 0.25 + random.gauss(0, 1.5)
         s["pm25"] += max(-8.0, min(8.0, langkah))
-    s["pm25"] = max(2.0, min(PM25_SIM_MAKS, s["pm25"]))
+    s["pm25"] = max(PM25_SIM_MIN, min(PM25_SIM_MAKS, s["pm25"]))
 
     s["r1"]  = max(0.45, min(0.80, s["r1"]  + random.gauss(0, 0.03)))
     s["r10"] = max(1.30, min(2.20, s["r10"] + random.gauss(0, 0.08)))
