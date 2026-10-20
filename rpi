@@ -13,6 +13,8 @@ satu-satunya penggerak, PM1.0 & PM10 diturunkan dari PM2.5 dengan rasio yang ber
 pelan, sehingga ketiganya tidak lagi saling berdekatan (lihat _generate_pm_tanpa_sensor,
 _paksa_urutan_pm, generate_prediksi_simulasi, generate_data_simulasi).
 Saklar: PMS_SIMULASI_TANPA_SENSOR (True = PM digenerate, False = pakai sensor PMS5003T).
+PERUBAHAN LOKASI: sumber data yang dikirim ke database/predikta.site sekarang
+"pontianak" (sebelumnya "ketapang") — lihat LOKASI di bagian konfigurasi.
 
 Menjalankan:
   python predikta.py                       -> sama seperti menjalankan main.py yang diunggah
@@ -82,7 +84,7 @@ LOG_DIR      = os.path.join(BASE_DIR, "logs")
 #
 # Nilai HARUS memakai salah satu key di LOKASI_INFO di bawah supaya
 # metadata (nama, kabupaten, dst) ikut terkirim dengan benar.
-LOKASI = "ketapang"   # unit ini terpasang di Ketapang — JANGAN diubah
+LOKASI = "pontianak"   # unit ini terpasang di Pontianak
 
 LOKASI_INFO = {
     "ketapang": {
@@ -585,7 +587,7 @@ def init_db():
             timestamp       TEXT NOT NULL,
 
             -- Lokasi perangkat (BARU) — "ketapang" / "pontianak", lihat config.LOKASI
-            lokasi          TEXT DEFAULT 'ketapang',
+            lokasi          TEXT DEFAULT 'pontianak',
 
             -- Data sensor
             suhu            REAL,
@@ -680,7 +682,7 @@ def init_db():
     # Migrasi kolom BARU: lokasi + klasifikasi per bencana (kebakaran/banjir/
     # pencemaran udara), untuk database lama yang dibuat sebelum fitur ini ada.
     kolom_baru = {
-        "lokasi"                : "TEXT DEFAULT 'ketapang'",
+        "lokasi"                : "TEXT DEFAULT 'pontianak'",
         "curah_hujan"           : "REAL",
         "status_hujan"          : "TEXT",
         "confidence_hujan"      : "REAL",
@@ -2248,7 +2250,7 @@ def format_payload_predikta(entri):
     return {
         "api_key": API_KEY,
         "timestamp": entri.get("timestamp"),
-        "lokasi": entri.get("lokasi", "ketapang"),
+        "lokasi": entri.get("lokasi", "pontianak"),
         "suhu": s.get("suhu"),
         "kelembapan": s.get("kelembapan"),
         "pm1_0": s.get("pm1_0"),
