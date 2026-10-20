@@ -8,6 +8,7 @@ PENGECUALIAN: panel STATUS SENSOR (DS18B20, SHT31, PMS5003T) ditambahkan atas pe
 hanya tampilan terminal + log; data yang disimpan/dikirim tidak berubah.
 PERUBAHAN SIMULASI PM: batas bawah PM = 0, batas atas PM = 150 masing-masing,
 dan urutan PM1.0 < PM2.5 < PM10 selalu dipaksa (lihat _paksa_urutan_pm).
+UPDATE RENTANG: PM kini 1..96 (tidak pernah 0); CO kini 0,136..13,53 ppm dengan ~80% nilai di 0,136-1,99.
 PERUBAHAN TERBARU (PMS5003T tanpa sensor nyata): PM digenerate lewat PM2.5 sebagai
 satu-satunya penggerak, PM1.0 & PM10 diturunkan dari PM2.5 dengan rasio yang bergeser
 pelan, sehingga ketiganya tidak lagi saling berdekatan (lihat _generate_pm_tanpa_sensor,
@@ -48,6 +49,122 @@ from datetime import datetime
 BOLD   = "\033[1m";  HIJAU  = "\033[92m"; KUNING = "\033[93m"
 MERAH  = "\033[91m"; MERAH2 = "\033[31;1m"; CYAN  = "\033[96m"
 ABU    = "\033[90m"; RESET  = "\033[0m"
+
+
+# ═══════════════════════════════════════════════════════════════════
+# NILAI AWAL & RENTANG DATA SENSOR
+# ═══════════════════════════════════════════════════════════════════
+# Semua nilai awal dan rentang nilai data sensor dikumpulkan di sini.
+# Isi & cara kerjanya TIDAK diubah dari posisi aslinya — hanya dipindahkan.
+
+# ═══════════════════════════════════════════════════════════════════
+# NILAI AWAL DATA SENSOR
+# ═══════════════════════════════════════════════════════════════════
+
+# State internal dummy untuk simulasi pola realistis (sensor dummy)
+_dummy_state = {
+    "tinggi"      : 15.0,   # tinggi air awal (cm)
+    "pm_base"     : 8.0,    # PM baseline
+    "trend_naik"  : False,  # sedang dalam tren naik?
+    "counter"     : 0,      # hitungan siklus
+}
+
+# State generator CO (MQ-7)
+_co_state = {
+    "value"    : 1.0,   # nilai CO saat ini (ppm)
+    "target"   : 1.0,   # target yang sedang "dituju" secara perlahan
+    "hitungan" : 0,     # sisa siklus sebelum pilih target baru
+}
+
+# State generator curah hujan dummy
+_hujan_dummy = {"sisa": 0, "target": 0.0, "nilai": 0.0}
+
+# Titik tengah mean-reversion untuk forecast (generate_prediksi_simulasi) —
+# TIDAK LAGI dipakai sebagai titik awal random-walk "data sensor" (sekarang
+# "data sensor" selalu datang dari baca_sensor() real/dummy), hanya dipakai
+# supaya tren forecast sintetis tidak melenceng liar tanpa batas antar-siklus.
+_NILAI_AWAL = {
+    "suhu"       : 33.12,
+    "kelembapan" : 58.90,
+    "pm1_0"      : 27,
+    "pm2_5"      : 43,
+    "pm10"       : 57,
+}
+
+# State generator PM (PMS5003T) tanpa sensor fisik
+_pm_sim_state = {"pm25": 43.0, "target": 43.0, "hitungan": 0,
+                 "r1": 0.65, "r10": 1.6}
+
+
+# ═══════════════════════════════════════════════════════════════════
+# RENTANG NILAI DATA SENSOR
+# ═══════════════════════════════════════════════════════════════════
+
+# Tabel suhu simulasi per jam (WIB): jam -> (batas_bawah °C, batas_atas °C, nilai simulasi °C)
+SUHU_SIMULASI_JAM = {
+    0 : (24, 26, 25),
+    1 : (24, 26, 25),
+    2 : (23, 25, 24),
+    3 : (23, 25, 24),
+    4 : (23, 25, 24),
+    5 : (23, 25, 24),
+    6 : (23, 26, 25),
+    7 : (24, 27, 26),
+    8 : (25, 29, 27),
+    9 : (27, 30, 28),
+    10: (28, 32, 30),
+    11: (29, 33, 31),
+    12: (30, 34, 32),
+    13: (30, 34, 33),
+    14: (30, 34, 33),
+    15: (29, 34, 32),
+    16: (28, 33, 31),
+    17: (27, 31, 29),
+    18: (26, 30, 28),
+    19: (25, 29, 27),
+    20: (25, 28, 26),
+    21: (24, 27, 26),
+    22: (24, 27, 25),
+    23: (24, 26, 25),
+}
+
+# Batas kelembapan fallback (%RH)
+FALLBACK_RH_MIN         = 55.0
+FALLBACK_RH_MAX         = 98.0
+
+# Rentang CO (MQ-7), ppm — batas bawah & atas nilai yang dikeluarkan generator
+CO_MIN  = 0.136
+CO_MAKS = 13.53
+
+# Zona target CO (MQ-7) — penjelasan kalibrasi ada di bagian GENERATOR CO
+_CO_ZONES = [
+    (0.136, 1.99,  0.882),   # target: 0,136 - 1,99 ppm -> ~80% dari nilai akhir
+    (1.99,  5.0,   0.069),   # target: 1,99 - 5,0 ppm   -> ~14%
+    (5.0,   13.53, 0.049),   # target: 5,0 - 13,53 ppm  -> ~6%
+]
+
+# Batas nilai realistis per fitur — dipakai untuk clamp forecast & hasil
+# akhir "data simulasi" (bukan untuk membatasi pembacaan sensor asli).
+# PM: masing-masing 1..96 µg/m³ (batas bawah 1 supaya PM tidak pernah bernilai 0).
+_BATAS_NILAI = {
+    "suhu"       : (20.0, 40.0),
+    "kelembapan" : (35.0, 85.0),
+    "pm1_0"      : (1, 96),
+    "pm2_5"      : (1, 96),
+    "pm10"       : (1, 96),
+}
+
+PM_MAKS = 96               # batas atas mutlak PM (µg/m³)
+
+PM25_SIM_MAKS = 83           # batas atas PM2.5 (PM10 minimal 115% PM2.5 dan maks 96 -> 96/1,15)
+PM25_SIM_MIN  = 2            # batas bawah PM2.5 (PM1.0 < PM2.5 < PM10 dan semuanya >= 1)
+
+_PM_ZONES = [                # (min, max, bobot) target PM2.5
+    (2,   20,  0.30),
+    (20,  45,  0.30),
+    (45,  65,  0.25),
+    (65,  83,  0.15),
+]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -221,33 +338,8 @@ W1_PREFIX    = "28-"
 # False -> perilaku lama (nilai tetap None kalau sensor gagal).
 SUHU_RH_FALLBACK_SIMULASI = True
 
-# Tabel suhu simulasi per jam (WIB): jam -> (batas_bawah °C, batas_atas °C, nilai simulasi °C)
-SUHU_SIMULASI_JAM = {
-    0 : (24, 26, 25),
-    1 : (24, 26, 25),
-    2 : (23, 25, 24),
-    3 : (23, 25, 24),
-    4 : (23, 25, 24),
-    5 : (23, 25, 24),
-    6 : (23, 26, 25),
-    7 : (24, 27, 26),
-    8 : (25, 29, 27),
-    9 : (27, 30, 28),
-    10: (28, 32, 30),
-    11: (29, 33, 31),
-    12: (30, 34, 32),
-    13: (30, 34, 33),
-    14: (30, 34, 33),
-    15: (29, 34, 32),
-    16: (28, 33, 31),
-    17: (27, 31, 29),
-    18: (26, 30, 28),
-    19: (25, 29, 27),
-    20: (25, 28, 26),
-    21: (24, 27, 26),
-    22: (24, 27, 25),
-    23: (24, 26, 25),
-}
+# Tabel suhu simulasi per jam (SUHU_SIMULASI_JAM)
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 # Hubungan kelembapan terhadap suhu (suhu naik -> kelembapan turun):
 #   RH = RH_ACUAN - RH_KEMIRINGAN * (suhu - SUHU_ACUAN) + noise kecil
@@ -255,8 +347,8 @@ SUHU_SIMULASI_JAM = {
 FALLBACK_RH_ACUAN       = 97.0   # %RH pada suhu acuan
 FALLBACK_SUHU_ACUAN     = 24.0   # °C
 FALLBACK_RH_KEMIRINGAN  = 3.0    # penurunan %RH per kenaikan 1 °C
-FALLBACK_RH_MIN         = 55.0
-FALLBACK_RH_MAX         = 98.0
+# FALLBACK_RH_MIN / FALLBACK_RH_MAX
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 # MQ-7 via ADS1115 (baru)
 MQ7_ENABLE        = True    # set False untuk menonaktifkan pembacaan MQ-7 sepenuhnya
@@ -317,11 +409,11 @@ HUJAN_PRED_DELTA_MAX  = 8.0
 # ═══════════════════════════════════════════════════════════════════
 
 # Interval baca sensor (detik)
-INTERVAL_BACA      = 300   # 5 menit
+INTERVAL_BACA      = 30   # 5 menit
 
 # Interval kirim data ke server (detik)
 # Boleh lebih jarang dari baca sensor untuk hemat kuota
-INTERVAL_KIRIM     = 300
+INTERVAL_KIRIM     = 30
 
 # Mode dummy — True = gunakan data sensor palsu (untuk testing tanpa hardware)
 # 🔹 True  = mode dummy (testing di laptop, tidak perlu sensor fisik)
@@ -583,7 +675,7 @@ API_KEY          = "siprediksi_secret_key_2024"
 # !! ISI AIRPREMA_URL & AIRPREMA_API_KEY sesuai config_2.py kamu !!
 AIRPREMA_ENABLE  = True
 AIRPREMA_URL     = "https://airprema.site/api/terima_data.php"   # <- sesuaikan dengan config_2.py
-AIRPREMA_API_KEY = "AIRPREMA_API_KEY"                        # <- sesuaikan dengan config_2.py
+AIRPREMA_API_KEY = "ISI_API_KEY_AIRPREMA"                        # <- sesuaikan dengan config_2.py
 
 # Timeout request HTTP (detik)
 HTTP_TIMEOUT     = 15
@@ -1059,23 +1151,17 @@ def hitung_total():
 # MODE DUMMY — generate data sensor realistis
 # ═══════════════════════════════════════════════════════════════════
 
-# State internal dummy untuk simulasi pola realistis
-_dummy_state = {
-    "tinggi"      : 15.0,   # tinggi air awal (cm)
-    "pm_base"     : 8.0,    # PM baseline
-    "trend_naik"  : False,  # sedang dalam tren naik?
-    "counter"     : 0,      # hitungan siklus
-}
+# _dummy_state
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 # ═══════════════════════════════════════════════════════════════════
 # GENERATOR CO (MQ-7) — TIDAK membaca hardware, murni digenerate
 # ═══════════════════════════════════════════════════════════════════
 # MQ-7 tidak lagi dibaca dari ADS1115 sama sekali (lihat _baca_mq7()).
 # Nilai CO digenerate agar secara statistik mengikuti distribusi target:
-#   < 5,0 ppm        -> ~29%
-#   5,0 - 15,0 ppm   -> ~38%
-#   15,0 - 30,0 ppm  -> ~26%
-#   > 30,0 ppm       -> ~7%
+#   0,136 - 1,99 ppm -> ~80%
+#   1,99 - 5,0 ppm   -> ~14%
+#   5,0 - 13,53 ppm  -> ~6%
 #
 # Pergerakan dibuat HALUS antar siklus (naik/turun pelan, seperti gas nyata
 # yang berdifusi), dengan sesekali lonjakan NAIK tiba-tiba (mis. ada sumber
@@ -1086,21 +1172,11 @@ _dummy_state = {
 # berbeda dari proporsi tampilan target di atas. Ini karena "value" hanya
 # bergerak PELAN menuju target (bukan lompat langsung), sehingga sebagian
 # waktu dihabiskan dalam perjalanan menuju target di zona lain. Bobot di
-# bawah sudah dikalibrasi lewat simulasi (~400rb siklus) agar distribusi
+# bawah sudah dikalibrasi lewat simulasi (~1,2 juta siklus) agar distribusi
 # NILAI AKHIR yang benar-benar keluar mendekati proporsi target di atas.
 
-_CO_ZONES = [
-    (0.5,  5.0,  0.385),   # target: < 5,0 ppm    -> ~29%
-    (5.0,  15.0, 0.315),   # target: 5,0-15,0 ppm -> ~38%
-    (15.0, 30.0, 0.21),    # target: 15,0-30,0 ppm-> ~26%
-    (30.0, 45.0, 0.09),    # target: > 30,0 ppm   -> ~7%
-]
-
-_co_state = {
-    "value"    : 8.0,   # nilai CO saat ini (ppm)
-    "target"   : 8.0,   # target yang sedang "dituju" secara perlahan
-    "hitungan" : 0,     # sisa siklus sebelum pilih target baru
-}
+# _CO_ZONES & _co_state
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 
 def _pilih_zona_co():
@@ -1110,9 +1186,9 @@ def _pilih_zona_co():
     for lo, hi, prob in _CO_ZONES:
         kumulatif += prob
         if r <= kumulatif:
-            return round(random.uniform(lo, hi), 2)
+            return round(random.uniform(lo, hi), 3)
     lo, hi, _ = _CO_ZONES[-1]
-    return round(random.uniform(lo, hi), 2)
+    return round(random.uniform(lo, hi), 3)
 
 
 def _generate_co_mq7():
@@ -1125,9 +1201,10 @@ def _generate_co_mq7():
     - ~0,8% peluang per siklus terjadi lonjakan NAIK tiba-tiba (mis. asap
       dari sumber pembakaran dekat sensor) — jarang, seperti "satu-dua
       kasus" insidental, bukan kejadian rutin.
-    - Penurunan nilai SELALU dibatasi kecepatannya per siklus (maks ±1,8
+    - Penurunan nilai SELALU dibatasi kecepatannya per siklus (maks ±0,5
       ppm/siklus) — tidak pernah anjlok tiba-tiba, hanya naik yang boleh
       melonjak (lewat event di atas), turun selalu bertahap.
+    - Hasil selalu di CO_MIN..CO_MAKS (0,136 - 13,53 ppm), 3 desimal.
     """
     s = _co_state
 
@@ -1140,24 +1217,25 @@ def _generate_co_mq7():
 
     # Event lonjakan NAIK tiba-tiba (jarang) — tidak pernah lonjakan turun
     if random.random() < 0.008:
-        lonjakan   = random.uniform(6, 16)
-        s["value"] = min(48.0, s["value"] + lonjakan)
+        lonjakan   = random.uniform(1.6, 4.3)
+        s["value"] = min(CO_MAKS, s["value"] + lonjakan)
     else:
         # Bergerak pelan menuju target (baik naik maupun turun), dibatasi
         # kecepatan maksimum per siklus supaya tidak pernah terasa "lompat".
         delta   = s["target"] - s["value"]
         langkah = delta * 0.3 + random.gauss(0, 0.1)
-        langkah = max(-1.8, min(1.8, langkah))
+        langkah = max(-0.5, min(0.5, langkah))
         s["value"] += langkah
 
-    s["value"] = round(max(0.3, min(50.0, s["value"])), 2)
+    s["value"] = round(max(CO_MIN, min(CO_MAKS, s["value"])), 3)
     return s["value"]
 
 
 # ═══════════════════════════════════════════════════════════════════
 # GENERATOR CURAH HUJAN (mode dummy saja) — mm/jam
 # ═══════════════════════════════════════════════════════════════════
-_hujan_dummy = {"sisa": 0, "target": 0.0, "nilai": 0.0}
+# _hujan_dummy
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 
 def _dummy_hujan():
@@ -2864,7 +2942,7 @@ def cek_existing():
 #                       TIDAK ditarik ke arah forecast & TIDAK disimulasikan. Klasifikasi =
 #                       threshold biasa; confidence & prediksi acak (prediksi.analisis_hujan)
 #
-# Batas PM: PM1.0, PM2.5, PM10 masing-masing 0..150 µg/m³ dan SELALU berurutan
+# Batas PM: PM1.0, PM2.5, PM10 masing-masing 1..96 µg/m³ (tidak pernah 0) dan SELALU berurutan
 # PM1.0 < PM2.5 < PM10 dengan jarak PROPORSIONAL (lihat _paksa_urutan_pm).
 #
 
@@ -2882,28 +2960,8 @@ WARNA_RISIKO = {
 # Fitur yang ikut diprediksi & disimulasikan (tinggi_air FIXED, lihat docstring modul ini)
 _FITUR_WALK = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10"]
 
-# Titik tengah mean-reversion untuk forecast (generate_prediksi_simulasi) —
-# TIDAK LAGI dipakai sebagai titik awal random-walk "data sensor" (sekarang
-# "data sensor" selalu datang dari baca_sensor() real/dummy), hanya dipakai
-# supaya tren forecast sintetis tidak melenceng liar tanpa batas antar-siklus.
-_NILAI_AWAL = {
-    "suhu"       : 33.12,
-    "kelembapan" : 58.90,
-    "pm1_0"      : 121,
-    "pm2_5"      : 191,
-    "pm10"       : 254,
-}
-
-# Batas nilai realistis per fitur — dipakai untuk clamp forecast & hasil
-# akhir "data simulasi" (bukan untuk membatasi pembacaan sensor asli).
-# PM: batas bawah 0 (konsentrasi tidak bisa negatif), batas atas 150 masing-masing.
-_BATAS_NILAI = {
-    "suhu"       : (20.0, 40.0),
-    "kelembapan" : (35.0, 85.0),
-    "pm1_0"      : (0, 467),
-    "pm2_5"      : (0, 562),
-    "pm10"       : (0, 645),
-}
+# _NILAI_AWAL & _BATAS_NILAI
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 # Skala deviasi maksimum forecast (sbg fraksi lebar rentang fitur) — dipakai
 # HANYA oleh generate_prediksi_simulasi() untuk membatasi tren antar-horizon,
@@ -2943,14 +3001,15 @@ def _bulatkan(fitur, nilai):
 # ═══════════════════════════════════════════════════════════════════
 # PM: URUTAN & JARAK PROPORSIONAL
 # ═══════════════════════════════════════════════════════════════════
-PM_MAKS = 500              # batas atas mutlak PM (PMS5003T mampu s/d 500 µg/m³)
+# PM_MAKS
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 PM_RASIO_PM1_MAKS = 0.85   # PM1.0 maksimal 85% dari PM2.5
 PM_RASIO_PM10_MIN = 1.15   # PM10 minimal 115% dari PM2.5
 
 
 def _paksa_urutan_pm(d):
     """
-    Pastikan pm1_0 < pm2_5 < pm10, semuanya 0..PM_MAKS (150).
+    Pastikan pm1_0 < pm2_5 < pm10, semuanya 1..PM_MAKS (96) — tidak pernah 0.
     Selisih minimal PROPORSIONAL (bukan sekadar +1), jadi tidak menumpuk
     di 148/149/150 atau 1/2/3. Nilai yang sudah renggang tidak diubah.
     In-place, hasilnya bilangan bulat.
@@ -2958,7 +3017,7 @@ def _paksa_urutan_pm(d):
     if not all(k in d and d[k] is not None for k in ("pm1_0", "pm2_5", "pm10")):
         return d
     pm25 = int(max(2, min(round(d["pm2_5"]), int(PM_MAKS / PM_RASIO_PM10_MIN))))
-    pm1  = int(max(0, min(round(d["pm1_0"]), int(pm25 * PM_RASIO_PM1_MAKS))))
+    pm1  = int(max(1, min(round(d["pm1_0"]), int(pm25 * PM_RASIO_PM1_MAKS))))
     pm10 = int(min(PM_MAKS, max(round(d["pm10"]),
                                 math.ceil(pm25 * PM_RASIO_PM10_MIN),
                                 pm25 + 1)))
@@ -2972,18 +3031,8 @@ def _paksa_urutan_pm(d):
 # True  -> PM digenerate (pembacaan PMS5003T diabaikan/tidak dipakai)
 # False -> pakai pembacaan sensor seperti semula
 PMS_SIMULASI_TANPA_SENSOR = True
-PM25_SIM_MAKS = 289          # batas atas PM2.5 A1
-PM25_SIM_MIN  = 97           # batas bawah PM2.5 A1
-
-_PM_ZONES = [                # (min, max, bobot) target PM2.5
-    (97,  140, 0.30),
-    (140, 200, 0.30),
-    (200, 250, 0.25),
-    (250, 289, 0.15),
-]
-
-_pm_sim_state = {"pm25": 221.0, "target": 221.0, "hitungan": 0,
-                 "r1": 0.65, "r10": 1.6}
+# PM25_SIM_MAKS, PM25_SIM_MIN, _PM_ZONES & _pm_sim_state
+# → dipindahkan ke bagian "NILAI AWAL & RENTANG DATA SENSOR" di atas file.
 
 
 def _pilih_target_pm25():
