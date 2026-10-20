@@ -577,6 +577,14 @@ SIMULASI_PREDIKTA_AKURASI = [
 SERVER_URL       = "https://predikta.site/api/terima_data.php"
 API_KEY          = "siprediksi_secret_key_2024"
 
+# ── Server KEDUA: airprema.site (Bi-LSTM kualitas udara) ────────────────
+# True  -> data juga dikirim ke airprema.site (independen dari predikta.site)
+# False -> hanya kirim ke predikta.site
+# !! ISI AIRPREMA_URL & AIRPREMA_API_KEY sesuai config_2.py kamu !!
+AIRPREMA_ENABLE  = True
+AIRPREMA_URL     = "https://airprema.site/api/terima_data.php"   # <- sesuaikan dengan config_2.py
+AIRPREMA_API_KEY = "ISI_API_KEY_AIRPREMA"                        # <- sesuaikan dengan config_2.py
+
 # Timeout request HTTP (detik)
 HTTP_TIMEOUT     = 15
 
@@ -953,7 +961,9 @@ def tambah_antrian(data_sensor, hasil_svm, hasil_lstm, data_defor,
         },
         # ── Curah hujan (BARU): threshold + confidence/prediksi acak ──
         "hujan"    : hasil_hujan or {},
-        "terkirim" : False,
+        # Status pengiriman independen per server
+        "terkirim_predikta": False,
+        "terkirim_airprema": False,
     }
 
     antrian = _muat_antrian()
@@ -2431,6 +2441,34 @@ def format_payload_predikta(entri):
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FORMAT PAYLOAD — airprema.site (server kedua)
+# ═══════════════════════════════════════════════════════════════════
+
+def format_payload_airprema(entri):
+    """
+    Format satu entri antrian menjadi dict JSON untuk airprema.site.
+    Server ini melakukan inferensi Bi-LSTM sendiri, jadi payload berupa
+    data sensor mentah (PM1.0/2.5/10 + CO), bukan hasil klasifikasi.
+
+    PENTING: key JSON untuk CO adalah "co" (BUKAN "co_mq7") agar cocok dengan
+    kolom `co` di server. Nama field lokal Python (co_mq7) tidak berubah.
+    """
+    s = entri.get("sensor", {})
+    return {
+        "api_key"   : AIRPREMA_API_KEY,
+        "timestamp" : entri.get("timestamp"),
+        "lokasi"    : entri.get("lokasi", "pontianak"),
+        "suhu"      : s.get("suhu"),
+        "kelembapan": s.get("kelembapan"),
+        "pm1_0"     : s.get("pm1_0"),
+        "pm2_5"     : s.get("pm2_5"),
+        "pm10"      : s.get("pm10"),
+        "co"        : s.get("co_mq7"),
+        "sumber"    : s.get("sumber", "sensor"),
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════
 # PENGIRIMAN
 # ═══════════════════════════════════════════════════════════════════
 
@@ -2482,13 +2520,13 @@ def _kirim_batch(url, payload_list, api_key):
         return False, str(e)
 
 
-def _proses_target(antrian, url, api_key, format_fn, nama_log):
+def _proses_target(antrian, target_key, url, api_key, format_fn, nama_log):
     """
-    Kirim semua entri yang belum terkirim ke predikta.site.
+    Kirim semua entri yang belum terkirim ke satu target tertentu.
     Menandai entri sukses secara in-place di `antrian` (list of dict).
     Return (jumlah_sukses, pesan).
     """
-    belum_kirim = [e for e in antrian if not e.get("terkirim", False)]
+    belum_kirim = [e for e in antrian if not e.get(target_key, False)]
     if not belum_kirim:
         return 0, "tidak ada data"
 
@@ -2497,7 +2535,7 @@ def _proses_target(antrian, url, api_key, format_fn, nama_log):
 
     if sukses:
         for e in belum_kirim:
-            e["terkirim"] = True
+            e[target_key] = True
         catat_kirim_log(nama_log, "sukses", pesan, len(belum_kirim))
         logging.info(f"[KIRIM {nama_log}] {pesan}")
         return len(belum_kirim), pesan
@@ -2515,9 +2553,11 @@ def proses_pengiriman():
     """
     Fungsi utama pengiriman, dipanggil tiap INTERVAL_KIRIM:
       1. Muat antrian JSON
-      2. Jika ada koneksi -> kirim ke predikta.site
-      3. Entri yang sudah terkirim dibuang dari antrian
+      2. Jika ada koneksi -> kirim ke predikta.site & airprema.site (independen)
+      3. Entri yang sudah terkirim ke KEDUA server dibuang dari antrian
       4. Jika tidak ada koneksi -> log peringatan, coba lagi nanti
+    Kalau salah satu server gagal/down, entri tetap di antrian dan dicoba
+    lagi siklus berikutnya TANPA mengirim ulang ke server yang sudah sukses.
     """
     antrian = _muat_antrian()
     if not antrian:
@@ -2527,12 +2567,22 @@ def proses_pengiriman():
         logging.warning(f"Koneksi tidak tersedia. {len(antrian)} data pending di antrian.")
         return
 
-    _proses_target(antrian, SERVER_URL, API_KEY, format_payload_predikta, "predikta")
+    # Kirim ke predikta.site (SVM + LSTM + CNN)
+    _proses_target(antrian, "terkirim_predikta", SERVER_URL, API_KEY,
+                   format_payload_predikta, "predikta")
 
-    sisa = [e for e in antrian if not e.get("terkirim")]
+    # Kirim ke airprema.site (Bi-LSTM) — hanya jika diaktifkan
+    if AIRPREMA_ENABLE:
+        _proses_target(antrian, "terkirim_airprema", AIRPREMA_URL, AIRPREMA_API_KEY,
+                       format_payload_airprema, "airprema")
+
+    # Buang entri yang sudah terkirim ke KEDUA server
+    sisa = [e for e in antrian
+            if not (e.get("terkirim_predikta") and
+                    (not AIRPREMA_ENABLE or e.get("terkirim_airprema")))]
 
     if len(sisa) != len(antrian):
-        logging.info(f"{len(antrian) - len(sisa)} entri selesai terkirim, dibuang dari antrian")
+        logging.info(f"{len(antrian) - len(sisa)} entri selesai terkirim ke semua target, dibuang dari antrian")
 
     _simpan_antrian(sisa)
 
