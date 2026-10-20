@@ -1,0 +1,1 @@
+sudo apt update && sudo apt install -y python3-pip python3-venv python3-dev i2c-tools python3-smbus python3-rpi.gpio && python3 -m venv --system-site-packages ~/predikta-env && source ~/predikta-env/bin/activate && pip install numpy requests pyserial smbus2 joblib Pillow ai-edge-litert adafruit-blinka adafruit-circuitpython-sht31d adafruit-circuitpython-ads1x15 w1thermsensor
