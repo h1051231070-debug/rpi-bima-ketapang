@@ -16,6 +16,13 @@ Saklar: PMS_SIMULASI_TANPA_SENSOR (True = PM digenerate, False = pakai sensor PM
 PERUBAHAN LOKASI: sumber data yang dikirim ke database/predikta.site sekarang
 "pontianak" (sebelumnya "ketapang") — lihat LOKASI di bagian konfigurasi.
 
+PERUBAHAN BARU (FALLBACK SUHU & KELEMBAPAN): kalau sensor suhu (DS18B20) dan/atau
+kelembapan (SHT31) TIDAK TERBACA (None), nilainya digenerate otomatis mengikuti tabel
+suhu per jam (00.00-23.00, lihat SUHU_SIMULASI_JAM), dan kelembapan disesuaikan dengan
+suhu tersebut (suhu naik -> kelembapan turun). Kalau sensor terbaca normal, nilai sensor
+dipakai apa adanya. Saklar: SUHU_RH_FALLBACK_SIMULASI (True = aktif, False = nonaktif).
+Lihat _suhu_simulasi_jam(), _kelembapan_dari_suhu(), _isi_fallback_suhu_rh().
+
 Menjalankan:
   python predikta.py                       -> sama seperti menjalankan main.py yang diunggah
   python predikta.py --gambar foto.png     -> sama seperti prediksi_cnn_setup.py --gambar foto.png
@@ -206,6 +213,50 @@ PMS_TIMEOUT  = 5
 # DS18B20
 W1_BASE      = "/sys/bus/w1/devices/"
 W1_PREFIX    = "28-"
+
+# ── FALLBACK SUHU & KELEMBAPAN (BARU) ───────────────────────────────────
+# True  -> kalau DS18B20 (suhu) dan/atau SHT31 (kelembapan) tidak terbaca (None),
+#          nilainya digenerate mengikuti tabel suhu per jam (SUHU_SIMULASI_JAM),
+#          kelembapan menyesuaikan suhu. Kalau sensor terbaca, nilai sensor dipakai.
+# False -> perilaku lama (nilai tetap None kalau sensor gagal).
+SUHU_RH_FALLBACK_SIMULASI = True
+
+# Tabel suhu simulasi per jam (WIB): jam -> (batas_bawah °C, batas_atas °C, nilai simulasi °C)
+SUHU_SIMULASI_JAM = {
+    0 : (24, 26, 25),
+    1 : (24, 26, 25),
+    2 : (23, 25, 24),
+    3 : (23, 25, 24),
+    4 : (23, 25, 24),
+    5 : (23, 25, 24),
+    6 : (23, 26, 25),
+    7 : (24, 27, 26),
+    8 : (25, 29, 27),
+    9 : (27, 30, 28),
+    10: (28, 32, 30),
+    11: (29, 33, 31),
+    12: (30, 34, 32),
+    13: (30, 34, 33),
+    14: (30, 34, 33),
+    15: (29, 34, 32),
+    16: (28, 33, 31),
+    17: (27, 31, 29),
+    18: (26, 30, 28),
+    19: (25, 29, 27),
+    20: (25, 28, 26),
+    21: (24, 27, 26),
+    22: (24, 27, 25),
+    23: (24, 26, 25),
+}
+
+# Hubungan kelembapan terhadap suhu (suhu naik -> kelembapan turun):
+#   RH = RH_ACUAN - RH_KEMIRINGAN * (suhu - SUHU_ACUAN) + noise kecil
+#   contoh: 25°C -> ~94%, 28°C -> ~85%, 32°C -> ~73%, 33°C -> ~70%
+FALLBACK_RH_ACUAN       = 97.0   # %RH pada suhu acuan
+FALLBACK_SUHU_ACUAN     = 24.0   # °C
+FALLBACK_RH_KEMIRINGAN  = 3.0    # penurunan %RH per kenaikan 1 °C
+FALLBACK_RH_MIN         = 55.0
+FALLBACK_RH_MAX         = 98.0
 
 # MQ-7 via ADS1115 (baru)
 MQ7_ENABLE        = True    # set False untuk menonaktifkan pembacaan MQ-7 sepenuhnya
@@ -1189,6 +1240,79 @@ def _dummy_sensor():
 
 
 # ═══════════════════════════════════════════════════════════════════
+# FALLBACK SUHU & KELEMBAPAN (BARU) — dipakai saat DS18B20 / SHT31 tidak terbaca
+# ═══════════════════════════════════════════════════════════════════
+# Suhu mengikuti tabel SUHU_SIMULASI_JAM (config di atas): tiap jam punya
+# rentang (lo-hi) dan nilai simulasi. Agar tidak "loncat" di pergantian jam,
+# nilai dihitung dengan interpolasi linier antara nilai jam ini dan jam
+# berikutnya (berdasarkan menit), ditambah noise kecil, lalu dijaga tetap
+# di dalam rentang jam saat ini. Kelembapan dihitung dari suhu hasil
+# generate (suhu naik -> kelembapan turun), lihat _kelembapan_dari_suhu().
+
+# Menandai nilai mana yang saat ini berasal dari fallback (dibaca panel status sensor).
+_FALLBACK_AKTIF = {"suhu": False, "kelembapan": False}
+
+
+def _suhu_simulasi_jam(waktu=None):
+    """
+    Generate suhu (°C) sesuai tabel SUHU_SIMULASI_JAM untuk jam `waktu`
+    (default: sekarang). Hasil selalu berada di rentang jam tersebut.
+    """
+    waktu = waktu or datetime.now()
+    jam   = waktu.hour
+    lo, hi, nilai = SUHU_SIMULASI_JAM[jam]
+    _, _, nilai_next = SUHU_SIMULASI_JAM[(jam + 1) % 24]
+
+    # Interpolasi halus ke nilai jam berikutnya (0..1 sepanjang jam berjalan)
+    frac = (waktu.minute + waktu.second / 60.0) / 60.0
+    suhu = nilai + (nilai_next - nilai) * frac
+
+    # Variasi kecil supaya tidak datar sempurna
+    suhu += random.gauss(0, 0.2)
+
+    suhu = max(lo, min(hi, suhu))
+    return round(suhu, 2)
+
+
+def _kelembapan_dari_suhu(suhu):
+    """
+    Kelembapan (%RH) yang menyesuaikan suhu: suhu naik -> kelembapan turun.
+        RH = FALLBACK_RH_ACUAN - FALLBACK_RH_KEMIRINGAN * (suhu - FALLBACK_SUHU_ACUAN) + noise
+    Contoh: 25°C ~94%, 28°C ~85%, 32°C ~73%, 33°C ~70%.
+    """
+    rh = FALLBACK_RH_ACUAN - FALLBACK_RH_KEMIRINGAN * (suhu - FALLBACK_SUHU_ACUAN)
+    rh += random.gauss(0, 1.0)
+    rh = max(FALLBACK_RH_MIN, min(FALLBACK_RH_MAX, rh))
+    return round(rh, 2)
+
+
+def _isi_fallback_suhu_rh(data):
+    """
+    Isi suhu/kelembapan yang None (sensor tidak terbaca) di dict `data` (in-place):
+      - suhu None        -> digenerate dari tabel jam
+      - kelembapan None  -> digenerate dari suhu (suhu sensor kalau terbaca,
+                            kalau tidak, suhu hasil generate)
+    Nilai sensor yang terbaca TIDAK diubah. Mengisi _FALLBACK_AKTIF untuk panel status.
+    """
+    _FALLBACK_AKTIF["suhu"]       = False
+    _FALLBACK_AKTIF["kelembapan"] = False
+    if not SUHU_RH_FALLBACK_SIMULASI:
+        return data
+
+    if data.get("suhu") is None:
+        data["suhu"] = _suhu_simulasi_jam()
+        _FALLBACK_AKTIF["suhu"] = True
+        logging.warning(f"[SENSOR] DS18B20 tidak terbaca -> suhu simulasi jam {datetime.now().hour:02d}.00 = {data['suhu']} °C")
+
+    if data.get("kelembapan") is None:
+        data["kelembapan"] = _kelembapan_dari_suhu(data["suhu"])
+        _FALLBACK_AKTIF["kelembapan"] = True
+        logging.warning(f"[SENSOR] SHT31 tidak terbaca -> kelembapan simulasi (menyesuaikan suhu {data['suhu']} °C) = {data['kelembapan']} %RH")
+
+    return data
+
+
+# ═══════════════════════════════════════════════════════════════════
 # SENSOR NYATA — baca hardware langsung
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1512,8 +1636,14 @@ def baca_sensor():
         atau None jika SEMUA sensor inti (FITUR_INPUT) gagal (hanya mode nyata).
         Kegagalan MQ-7 saja TIDAK menggagalkan siklus, karena CO bukan bagian
         dari FITUR_INPUT yang dipakai SVM/LSTM/CNN (lihat config.py).
+
+    BARU: kalau suhu (DS18B20) / kelembapan (SHT31) tidak terbaca di mode
+    nyata, nilainya diisi otomatis dari tabel suhu per jam (lihat
+    _isi_fallback_suhu_rh) selama SUHU_RH_FALLBACK_SIMULASI = True.
     """
     if MODE_DUMMY:
+        _FALLBACK_AKTIF["suhu"]       = False
+        _FALLBACK_AKTIF["kelembapan"] = False
         data = _dummy_sensor()
     else:
         data = _baca_sensor_nyata()
@@ -1521,6 +1651,8 @@ def baca_sensor():
         fitur_gagal = [k for k in FITUR_INPUT if data.get(k) is None]
         if len(fitur_gagal) == len(FITUR_INPUT):
             return None  # semua sensor inti gagal
+        # Suhu / kelembapan yang tidak terbaca -> isi dari tabel suhu per jam
+        _isi_fallback_suhu_rh(data)
 
     data["timestamp"] = datetime.now().isoformat()
     return data
@@ -2640,6 +2772,8 @@ def cek_existing():
 #      (Khusus PM: kalau PMS_SIMULASI_TANPA_SENSOR=True, nilai PM1.0/PM2.5/PM10
 #      di langkah ini DIGENERATE oleh _generate_pm_tanpa_sensor(), bukan dibaca
 #      dari PMS5003T.)
+#      (Khusus suhu & kelembapan: kalau DS18B20/SHT31 tidak terbaca, nilainya
+#      diisi dari tabel suhu per jam — lihat _isi_fallback_suhu_rh().)
 #
 #   2. Kalau histori SQLite (via ambil_buffer_lstm) BELUM cukup TIMESTEP
 #      baris, "data sensor" hasil baca_sensor() dipakai APA ADANYA sebagai
@@ -3117,6 +3251,8 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
          ini (bisa None kalau semua sensor inti gagal di mode nyata, sama
          seperti main.py). Kalau PMS_SIMULASI_TANPA_SENSOR=True, PM digenerate
          oleh _generate_pm_tanpa_sensor() menggantikan pembacaan PMS5003T.
+         Kalau suhu/kelembapan tidak terbaca, baca_sensor() mengisinya dari
+         tabel suhu per jam (fallback).
       2. Kalau histori SQLite belum cukup TIMESTEP baris -> laporkan
          pembacaan sensor apa adanya (belum ada forecast pembanding).
       3. Kalau sudah cukup -> hitung forecast fresh (generate_prediksi_
@@ -3176,6 +3312,8 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
 #   OK        semua nilai sensor terbaca
 #   SEBAGIAN  sebagian nilai terbaca (khusus PMS5003T: PM1.0/PM2.5/PM10)
 #   GAGAL     tidak ada nilai yang terbaca (None) — mis. sensor kecabut
+#   FALLBACK  (BARU) DS18B20/SHT31 tidak terbaca -> nilai digenerate dari tabel
+#             suhu per jam (SUHU_SIMULASI_JAM); kelembapan menyesuaikan suhu
 #   DUMMY     MODE_DUMMY aktif -> data bukan dari sensor fisik
 #   SIMULASI  PMS5003T tanpa sensor fisik, PM digenerate (PMS_SIMULASI_TANPA_SENSOR)
 
@@ -3192,6 +3330,9 @@ _PANEL_SENSOR = [
                   ("pm10",  "PM10",  "µg/m³")]),
 ]
 
+# Sensor -> fitur yang bisa diisi fallback (untuk menentukan status FALLBACK)
+_FALLBACK_SENSOR = {"DS18B20": "suhu", "SHT31": "kelembapan"}
+
 
 def _catat_sensor_aktual(data_sensor):
     """Salin pembacaan sensor mentah + hitung status tiap sensor. Tidak pernah melempar error."""
@@ -3203,10 +3344,13 @@ def _catat_sensor_aktual(data_sensor):
 
         for nama, daftar in _PANEL_SENSOR:
             terbaca = [data.get(fitur) is not None for fitur, _, _ in daftar]
+            fitur_fb = _FALLBACK_SENSOR.get(nama)
             if dummy:
                 status = "DUMMY"
             elif nama == "PMS5003T" and PMS_SIMULASI_TANPA_SENSOR:
                 status = "SIMULASI"          # bukan error, memang digenerate
+            elif fitur_fb and _FALLBACK_AKTIF.get(fitur_fb):
+                status = "FALLBACK"          # sensor tidak terbaca, nilai dari tabel suhu per jam
             elif all(terbaca):
                 status = "OK"
             elif any(terbaca):
@@ -3214,7 +3358,7 @@ def _catat_sensor_aktual(data_sensor):
             else:
                 status = "GAGAL"
 
-            if status in ("GAGAL", "SEBAGIAN"):
+            if status in ("GAGAL", "SEBAGIAN", "FALLBACK"):
                 _GAGAL_BERTURUT[nama] = _GAGAL_BERTURUT.get(nama, 0) + 1
             else:
                 _GAGAL_BERTURUT[nama] = 0
@@ -3231,7 +3375,7 @@ def _tampilkan_panel_sensor(data_simulasi):
     """Tampilkan status sensor + data A1 berdampingan dengan data A2. Tidak pernah melempar error."""
     try:
         warna_status = {"OK": HIJAU, "SEBAGIAN": KUNING, "GAGAL": MERAH2,
-                        "DUMMY": KUNING, "SIMULASI": CYAN}
+                        "DUMMY": KUNING, "SIMULASI": CYAN, "FALLBACK": KUNING}
         ada_tanda    = False
 
         print(f"\n    {BOLD}STATUS SENSOR{RESET}  "
@@ -3261,14 +3405,19 @@ def _tampilkan_panel_sensor(data_simulasi):
 
         for nama, _ in _PANEL_SENSOR:
             n = _GAGAL_BERTURUT.get(nama, 0)
-            if n > 0:
+            if n > 0 and _STATUS_SENSOR.get(nama) in ("GAGAL", "SEBAGIAN"):
                 print(f"    {MERAH}⚠ {nama} bermasalah (tidak terbaca) selama {n} siklus berturut-turut — cek kabel/sensor{RESET}")
+            elif n > 0 and _STATUS_SENSOR.get(nama) == "FALLBACK":
+                print(f"    {KUNING}⚠ {nama} tidak terbaca selama {n} siklus berturut-turut — nilai diisi simulasi suhu per jam, cek kabel/sensor{RESET}")
         if ada_tanda:
             print(f"    {ABU}* nilai A2 diisi dari forecast karena sensor tidak terbaca{RESET}")
         if any(v == "DUMMY" for v in _STATUS_SENSOR.values()):
             print(f"    {ABU}MODE_DUMMY aktif: nilai 'A1' berasal dari generator dummy, bukan sensor fisik{RESET}")
         if _STATUS_SENSOR.get("PMS5003T") == "SIMULASI":
             print(f"    {ABU}PMS5003T: tanpa sensor fisik, nilai PM 'A1' digenerate (PMS_SIMULASI_TANPA_SENSOR=True){RESET}")
+        if any(v == "FALLBACK" for v in _STATUS_SENSOR.values()):
+            print(f"    {ABU}FALLBACK: sensor suhu/kelembapan tidak terbaca, nilai 'A1' digenerate dari tabel suhu jam "
+                  f"{datetime.now().hour:02d}.00 (SUHU_RH_FALLBACK_SIMULASI=True){RESET}")
     except Exception as e:
         logging.error(f"[SENSOR] Gagal menampilkan panel sensor: {e}")
 
@@ -3366,6 +3515,9 @@ def jalankan_mode_simulasi(demo=False):
     print(f"  {HIJAU}✓{RESET} Mode A2 independen predikta.site — baca sensor dulu, baru disimulasikan")
     if PMS_SIMULASI_TANPA_SENSOR:
         print(f"  {HIJAU}✓{RESET} PMS5003T: PM digenerate tanpa sensor fisik (PM2.5 sebagai penggerak, PM1.0/PM10 via rasio)")
+    if SUHU_RH_FALLBACK_SIMULASI:
+        print(f"  {HIJAU}✓{RESET} Fallback suhu & kelembapan aktif: kalau DS18B20/SHT31 tidak terbaca, "
+              f"nilai digenerate dari tabel suhu per jam")
 
     if demo:
         print(f"  {KUNING}Mode demo — satu siklus saja{RESET}")
