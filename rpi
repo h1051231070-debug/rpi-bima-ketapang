@@ -317,11 +317,11 @@ HUJAN_PRED_DELTA_MAX  = 8.0
 # ═══════════════════════════════════════════════════════════════════
 
 # Interval baca sensor (detik)
-INTERVAL_BACA      = 30   # 5 menit
+INTERVAL_BACA      = 300   # 5 menit
 
 # Interval kirim data ke server (detik)
 # Boleh lebih jarang dari baca sensor untuk hemat kuota
-INTERVAL_KIRIM     = 30
+INTERVAL_KIRIM     = 300
 
 # Mode dummy — True = gunakan data sensor palsu (untuk testing tanpa hardware)
 # 🔹 True  = mode dummy (testing di laptop, tidak perlu sensor fisik)
@@ -583,7 +583,7 @@ API_KEY          = "siprediksi_secret_key_2024"
 # !! ISI AIRPREMA_URL & AIRPREMA_API_KEY sesuai config_2.py kamu !!
 AIRPREMA_ENABLE  = True
 AIRPREMA_URL     = "https://airprema.site/api/terima_data.php"   # <- sesuaikan dengan config_2.py
-AIRPREMA_API_KEY = "ISI_API_KEY_AIRPREMA"                        # <- sesuaikan dengan config_2.py
+AIRPREMA_API_KEY = "AIRPREMA_API_KEY"                        # <- sesuaikan dengan config_2.py
 
 # Timeout request HTTP (detik)
 HTTP_TIMEOUT     = 15
