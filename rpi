@@ -317,11 +317,11 @@ HUJAN_PRED_DELTA_MAX  = 8.0
 # ═══════════════════════════════════════════════════════════════════
 
 # Interval baca sensor (detik)
-INTERVAL_BACA      = 300   # 5 menit
+INTERVAL_BACA      = 30   # 5 menit
 
 # Interval kirim data ke server (detik)
 # Boleh lebih jarang dari baca sensor untuk hemat kuota
-INTERVAL_KIRIM     = 300
+INTERVAL_KIRIM     = 30
 
 # Mode dummy — True = gunakan data sensor palsu (untuk testing tanpa hardware)
 # 🔹 True  = mode dummy (testing di laptop, tidak perlu sensor fisik)
@@ -1211,7 +1211,7 @@ def _dummy_sensor():
 
     # ── Kelembapan: berbanding terbalik suhu ──────────────────
     rh   = 80 - 0.8 * (suhu - 28) + random.gauss(0, 1.0)
-    rh   = round(max(40, min(98, rh)), 2)
+    rh   = round(max(47, min(92, rh)), 2)
 
     # ── PM: pola harian + spike 5% kemungkinan ────────────────
     if random.random() < 0.05:
@@ -2889,9 +2889,9 @@ _FITUR_WALK = ["suhu", "kelembapan", "pm1_0", "pm2_5", "pm10"]
 _NILAI_AWAL = {
     "suhu"       : 33.12,
     "kelembapan" : 58.90,
-    "pm1_0"      : 144,
-    "pm2_5"      : 221,
-    "pm10"       : 354,
+    "pm1_0"      : 121,
+    "pm2_5"      : 191,
+    "pm10"       : 254,
 }
 
 # Batas nilai realistis per fitur — dipakai untuk clamp forecast & hasil
@@ -2900,9 +2900,9 @@ _NILAI_AWAL = {
 _BATAS_NILAI = {
     "suhu"       : (20.0, 40.0),
     "kelembapan" : (35.0, 85.0),
-    "pm1_0"      : (0, 500),
-    "pm2_5"      : (0, 500),
-    "pm10"       : (0, 500),
+    "pm1_0"      : (0, 467),
+    "pm2_5"      : (0, 562),
+    "pm10"       : (0, 645),
 }
 
 # Skala deviasi maksimum forecast (sbg fraksi lebar rentang fitur) — dipakai
