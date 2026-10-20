@@ -672,10 +672,10 @@ API_KEY          = "siprediksi_secret_key_2024"
 # ── Server KEDUA: airprema.site (Bi-LSTM kualitas udara) ────────────────
 # True  -> data juga dikirim ke airprema.site (independen dari predikta.site)
 # False -> hanya kirim ke predikta.site
-# !! ISI AIRPREMA_URL & AIRPREMA_API_KEY sesuai config_2.py kamu !!
+# AIRPREMA_API_KEY sudah diisi: "AIRPREMA_KEY"
 AIRPREMA_ENABLE  = True
 AIRPREMA_URL     = "https://airprema.site/api/terima_data.php"   # <- sesuaikan dengan config_2.py
-AIRPREMA_API_KEY = "ISI_API_KEY_AIRPREMA"                        # <- sesuaikan dengan config_2.py
+AIRPREMA_API_KEY = "AIRPREMA_KEY"
 
 # Timeout request HTTP (detik)
 HTTP_TIMEOUT     = 15
@@ -2937,7 +2937,8 @@ def cek_existing():
 # Fitur FIXED (tidak pernah mengikuti forecast/tarikan sensor):
 #   - tinggi_air        selalu 0
 #   - prob_deforestasi  selalu nilai dari deforestasi.json (fallback 0.317)
-#   - co_mq7            tidak disimulasikan di modul ini (selalu None)
+#   - co_mq7            tidak ditarik ke arah forecast; nilainya dari baca_sensor() apa adanya
+#                       (digenerate _generate_co_mq7) dan ikut dikirim ke airprema
 #   - curah_hujan       memakai DATA REAL sensor hujan apa adanya (dari baca_sensor()) —
 #                       TIDAK ditarik ke arah forecast & TIDAK disimulasikan. Klasifikasi =
 #                       threshold biasa; confidence & prediksi acak (prediksi.analisis_hujan)
@@ -3376,7 +3377,7 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
     if not buffer:
         # Histori belum cukup untuk membuat forecast -> laporkan pembacaan
         # sensor apa adanya, tidak ada yang bisa "disimulasikan" dulu.
-        data_sensor["co_mq7"] = None
+        # (CO tetap dibawa apa adanya dari baca_sensor() supaya ikut terkirim ke airprema)
         logging.info(
             f"[A2] Histori belum cukup untuk forecast — pakai "
             f"pembacaan sensor apa adanya ({hitung_total()}/{TIMESTEP})"
@@ -3390,7 +3391,7 @@ def generate_baris_simulasi(state: "_StateSimulasi", svm: "KlasifikasiUtama"):
     data_final = generate_data_simulasi(data_sensor, target_h1)
 
     data_final["tinggi_air"] = 0
-    data_final["co_mq7"]     = None
+    data_final["co_mq7"]     = data_sensor.get("co_mq7")   # CO dibawa apa adanya dari baca_sensor() -> ikut terkirim ke airprema
     data_final["curah_hujan"] = data_sensor.get("curah_hujan")   # DATA REAL sensor hujan, apa adanya
     data_final["sumber"]     = "simulasi"
     data_final["timestamp"]  = datetime.now().isoformat()
