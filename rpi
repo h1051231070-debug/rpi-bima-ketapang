@@ -8,7 +8,8 @@ PENGECUALIAN: panel STATUS SENSOR (DS18B20, SHT31, PMS5003T) ditambahkan atas pe
 hanya tampilan terminal + log; data yang disimpan/dikirim tidak berubah.
 PERUBAHAN SIMULASI PM: batas bawah PM = 0, batas atas PM = 150 masing-masing,
 dan urutan PM1.0 < PM2.5 < PM10 selalu dipaksa (lihat _paksa_urutan_pm).
-UPDATE RENTANG: PM kini 1..96 (tidak pernah 0); CO kini 0,136..13,53 ppm dengan ~80% nilai di 0,136-1,99.
+UPDATE RENTANG: PM1.0/PM2.5 1..97 dan PM10 1..185 (tidak pernah 0), ~80% nilai PM2.5 di 42-97; CO kini 0,136..13,53 ppm
+dengan ~80% nilai di 0,136-1,99.
 PERUBAHAN TERBARU (PMS5003T tanpa sensor nyata): PM digenerate lewat PM2.5 sebagai
 satu-satunya penggerak, PM1.0 & PM10 diturunkan dari PM2.5 dengan rasio yang bergeser
 pelan, sehingga ketiganya tidak lagi saling berdekatan (lihat _generate_pm_tanpa_sensor,
@@ -86,13 +87,13 @@ _hujan_dummy = {"sisa": 0, "target": 0.0, "nilai": 0.0}
 _NILAI_AWAL = {
     "suhu"       : 33.12,
     "kelembapan" : 58.90,
-    "pm1_0"      : 27,
-    "pm2_5"      : 43,
-    "pm10"       : 57,
+    "pm1_0"      : 32,
+    "pm2_5"      : 50,
+    "pm10"       : 67,
 }
 
 # State generator PM (PMS5003T) tanpa sensor fisik
-_pm_sim_state = {"pm25": 43.0, "target": 43.0, "hitungan": 0,
+_pm_sim_state = {"pm25": 50.0, "target": 50.0, "hitungan": 0,
                  "r1": 0.65, "r10": 1.6}
 
 
@@ -145,25 +146,27 @@ _CO_ZONES = [
 
 # Batas nilai realistis per fitur — dipakai untuk clamp forecast & hasil
 # akhir "data simulasi" (bukan untuk membatasi pembacaan sensor asli).
-# PM: masing-masing 1..96 µg/m³ (batas bawah 1 supaya PM tidak pernah bernilai 0).
+# PM1.0 & PM2.5: 1..97 µg/m³; PM10: 1..185 µg/m³ (batas bawah 1 supaya PM tidak pernah bernilai 0).
 _BATAS_NILAI = {
     "suhu"       : (20.0, 40.0),
     "kelembapan" : (35.0, 85.0),
-    "pm1_0"      : (1, 96),
-    "pm2_5"      : (1, 96),
-    "pm10"       : (1, 96),
+    "pm1_0"      : (1, 97),
+    "pm2_5"      : (1, 97),
+    "pm10"       : (1, 185),
 }
 
-PM_MAKS = 96               # batas atas mutlak PM (µg/m³)
+PM_MAKS = 97               # batas atas PM1.0 & PM2.5 (µg/m³)
+PM10_MAKS = 185            # batas atas PM10 (µg/m³) — PM2.5 maks 84 x rasio PM10/PM2.5 maks 2,2 ≈ 185,
+                           # jadi PM10 tidak menumpuk di batas atas
 
-PM25_SIM_MAKS = 83           # batas atas PM2.5 (PM10 minimal 115% PM2.5 dan maks 96 -> 96/1,15)
+PM25_SIM_MAKS = 84           # batas atas PM2.5 (PM_MAKS 97 / PM_RASIO_PM10_MIN 1,15)
 PM25_SIM_MIN  = 2            # batas bawah PM2.5 (PM1.0 < PM2.5 < PM10 dan semuanya >= 1)
 
 _PM_ZONES = [                # (min, max, bobot) target PM2.5
-    (2,   20,  0.30),
-    (20,  45,  0.30),
-    (45,  65,  0.25),
-    (65,  83,  0.15),
+    (2,   42,  0.105),  # ~20% nilai akhir di bawah 42
+    (42,  48,  0.4475), # 42 - 84 -> ~80% nilai akhir PM2.5
+    (48,  56,  0.3356),
+    (56,  84,  0.1119),
 ]
 
 
@@ -646,18 +649,35 @@ SIMULASI_HORIZON     = 6
 #
 # Format: list of (akurasi_min, akurasi_max, probabilitas), probabilitas
 # HARUS berjumlah 1.0. Sesuai permintaan:
-#   10% di rentang 50%-60%
-#   10% di rentang 60%-70%
-#   20% di rentang 70%-80%
-#   40% di rentang 80%-90%
-#   20% di rentang 90%-99%
+#   12,5% di rentang 50%-60%
+#   12,5% di rentang 60%-70%
+#   45%   di rentang 70%-80%
+#   25%   di rentang 80%-90%
+#   5%    di rentang 90%-99%
 SIMULASI_PREDIKTA_AKURASI = [
-    (0.50, 0.60, 0.10),
-    (0.60, 0.70, 0.10),
-    (0.70, 0.80, 0.20),
-    (0.80, 0.90, 0.40),
-    (0.90, 0.99, 0.20),
+    (0.50, 0.60, 0.125),
+    (0.60, 0.70, 0.125),
+    (0.70, 0.80, 0.45),
+    (0.80, 0.90, 0.25),
+    (0.90, 0.99, 0.05),
 ]
+
+# ── Akurasi efektif PER FITUR (menimpa tabel 5 pita di atas) ─────────
+# Fitur yang terdaftar di sini memakai pita akurasinya sendiri, dan
+# deviasinya TIDAK lagi dibatasi oleh jarak prediksi->sensor (arahnya
+# tetap menuju sensor). Fitur yang tidak terdaftar tetap memakai tabel
+# 5 pita + batas jarak ke sensor seperti sebelumnya.
+# Format sama: list of (akurasi_min, akurasi_max, probabilitas), total 1.0.
+#   suhu & kelembapan : akurasi efektif TIDAK lebih dari 96,8%
+#   PM1.0/PM2.5/PM10  : akurasi efektif di 80-an persen, tiap PM beda kisarannya
+#                       (PM1.0 ~82%, PM2.5 ~85%, PM10 ~87-88%)
+SIMULASI_AKURASI_FITUR = {
+    "suhu"       : [(0.950, 0.968, 1.0)],
+    "kelembapan" : [(0.950, 0.968, 1.0)],
+    "pm1_0"      : [(0.80, 0.84, 1.0)],
+    "pm2_5"      : [(0.80, 0.89, 1.0)],
+    "pm10"       : [(0.86, 0.89, 1.0)],
+}
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -2943,7 +2963,7 @@ def cek_existing():
 #                       TIDAK ditarik ke arah forecast & TIDAK disimulasikan. Klasifikasi =
 #                       threshold biasa; confidence & prediksi acak (prediksi.analisis_hujan)
 #
-# Batas PM: PM1.0, PM2.5, PM10 masing-masing 1..96 µg/m³ (tidak pernah 0) dan SELALU berurutan
+# Batas PM: PM1.0 & PM2.5 1..97, PM10 1..185 µg/m³ (tidak pernah 0) dan SELALU berurutan
 # PM1.0 < PM2.5 < PM10 dengan jarak PROPORSIONAL (lihat _paksa_urutan_pm).
 #
 
@@ -3010,7 +3030,8 @@ PM_RASIO_PM10_MIN = 1.15   # PM10 minimal 115% dari PM2.5
 
 def _paksa_urutan_pm(d):
     """
-    Pastikan pm1_0 < pm2_5 < pm10, semuanya 1..PM_MAKS (96) — tidak pernah 0.
+    Pastikan pm1_0 < pm2_5 < pm10, PM1.0/PM2.5 maks PM_MAKS (97), PM10 maks PM10_MAKS (185),
+    semuanya minimal 1 — tidak pernah 0.
     Selisih minimal PROPORSIONAL (bukan sekadar +1), jadi tidak menumpuk
     di 148/149/150 atau 1/2/3. Nilai yang sudah renggang tidak diubah.
     In-place, hasilnya bilangan bulat.
@@ -3019,7 +3040,7 @@ def _paksa_urutan_pm(d):
         return d
     pm25 = int(max(2, min(round(d["pm2_5"]), int(PM_MAKS / PM_RASIO_PM10_MIN))))
     pm1  = int(max(1, min(round(d["pm1_0"]), int(pm25 * PM_RASIO_PM1_MAKS))))
-    pm10 = int(min(PM_MAKS, max(round(d["pm10"]),
+    pm10 = int(min(PM10_MAKS, max(round(d["pm10"]),
                                 math.ceil(pm25 * PM_RASIO_PM10_MIN),
                                 pm25 + 1)))
     d["pm1_0"], d["pm2_5"], d["pm10"] = pm1, pm25, pm10
@@ -3073,7 +3094,7 @@ def _generate_pm_tanpa_sensor():
 
     d = {"pm2_5": s["pm25"],
          "pm1_0": s["pm25"] * s["r1"],
-         "pm10" : min(PM_MAKS, s["pm25"] * s["r10"])}
+         "pm10" : min(PM10_MAKS, s["pm25"] * s["r10"])}
     return _paksa_urutan_pm(d)
 
 
@@ -3111,8 +3132,8 @@ def generate_akurasi_baru(pita=None):
     """
     Sampling akurasi (0-1) dari distribusi 5-pita SIMULASI_PREDIKTA_AKURASI
     (lihat config.py):
-        10% di 50%-60%, 10% di 60%-70%, 20% di 70%-80%,
-        40% di 80%-90%, 20% di 90%-99%.
+        12,5% di 50%-60%, 12,5% di 60%-70%, 45% di 70%-80%,
+        25% di 80%-90%, 5% di 90%-99%.
 
     Cara kerja: pilih satu pita secara acak sesuai bobot probabilitasnya
     (probabilitas kumulatif), lalu ambil UNIFORM dari rentang pita itu.
@@ -3278,7 +3299,8 @@ def generate_data_simulasi(data_sensor_asli: dict, target: dict,
     ini, dari baca_sensor()) — BUKAN lagi ke arah acak.
 
     Algoritma per fitur:
-        1. akurasi  = generate_akurasi_baru()   -> 0.50 - 0.99 (5 pita)
+        1. akurasi  = generate_akurasi_baru()   -> 0.50 - 0.99 (5 pita), atau pita per
+           fitur dari SIMULASI_AKURASI_FITUR (suhu/kelembapan <= 96,8%, PM 80-an%)
         2. deviasi  = abs(prediksi) * (1 - akurasi)
            (akurasi = 1 - abs(simulasi - prediksi) / abs(prediksi), lihat
            formula terbalik di atas — makin tinggi akurasi, makin kecil
@@ -3288,7 +3310,8 @@ def generate_data_simulasi(data_sensor_asli: dict, target: dict,
            mengikuti rentang data sensor AKTUAL, bukan arah acak.
         4. deviasi DIBATASI supaya tidak melewati jarak prediksi->sensor,
            jadi hasil akhir SELALU berada di antara prediksi & sensor
-           (lihat contoh pola di docstring modul).
+           (lihat contoh pola di docstring modul) — KECUALI fitur yang terdaftar di
+           SIMULASI_AKURASI_FITUR: deviasinya tidak dibatasi jarak ke sensor.
         5. Hasil akhir tetap di-clamp ke rentang realistis fitur (_BATAS_NILAI).
         6. Setelah semua fitur selesai, PM1.0 & PM10 DISESUAIKAN ulang dari
            PM2.5 memakai rasio pembacaan sensor siklus ini (PM disimulasikan
@@ -3312,11 +3335,15 @@ def generate_data_simulasi(data_sensor_asli: dict, target: dict,
             logging.warning(f"[A2] Sensor '{fitur}' None, pakai nilai prediksi")
             nilai_sensor = nilai_prediksi
 
-        akurasi = generate_akurasi_baru()
+        pita_fitur = SIMULASI_AKURASI_FITUR.get(fitur)   # None -> tabel 5 pita umum
+        akurasi = generate_akurasi_baru(pita_fitur)
         deviasi = abs(nilai_prediksi) * (1 - akurasi)
 
-        jarak_ke_sensor = abs(nilai_sensor - nilai_prediksi)
-        deviasi = min(deviasi, jarak_ke_sensor)   # jangan pernah melewati nilai sensor asli
+        if pita_fitur is None:
+            jarak_ke_sensor = abs(nilai_sensor - nilai_prediksi)
+            deviasi = min(deviasi, jarak_ke_sensor)   # jangan pernah melewati nilai sensor asli
+        # (fitur yang terdaftar di SIMULASI_AKURASI_FITUR: deviasi tidak dibatasi jarak ke sensor,
+        #  supaya akurasi efektif sama dengan akurasi yang diundi)
 
         arah       = 1 if nilai_sensor >= nilai_prediksi else -1
         nilai_baru = nilai_prediksi + arah * deviasi
@@ -3326,7 +3353,11 @@ def generate_data_simulasi(data_sensor_asli: dict, target: dict,
     # PM: jaga rasio antar-PM mengikuti pembacaan sensor siklus ini, supaya
     # ditarik terpisah pun hasilnya tidak saling menempel / bertabrakan.
     pm_s = [data_sensor_asli.get(k) for k in ("pm1_0", "pm2_5", "pm10")]
+    # (DILEWATI kalau ketiga PM punya pita akurasi sendiri di SIMULASI_AKURASI_FITUR:
+    #  PM1.0 & PM10 diundi sendiri-sendiri supaya akurasinya bisa dibedakan; urutan
+    #  PM1.0 < PM2.5 < PM10 tetap dijaga oleh _paksa_urutan_pm di bawah.)
     if all(k in hasil for k in ("pm1_0", "pm2_5", "pm10")) \
+            and not all(k in SIMULASI_AKURASI_FITUR for k in ("pm1_0", "pm2_5", "pm10")) \
             and all(v is not None for v in pm_s) and pm_s[1] > 0:
         r1  = max(0.40, min(0.85, pm_s[0] / pm_s[1]))
         r10 = max(1.20, min(2.50, pm_s[2] / pm_s[1]))
