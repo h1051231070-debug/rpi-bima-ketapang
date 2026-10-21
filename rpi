@@ -679,6 +679,20 @@ SIMULASI_AKURASI_FITUR = {
     "pm10"       : [(0.86, 0.89, 1.0)],
 }
 
+# ── Prediksi KHUSUS airprema.site (hanya PM & CO) ────────────────────
+# Nilai prediksi terpisah dari prediksi predikta.site (LSTM sintetis di atas).
+# Dihitung dari nilai aktual yang dikirim di baris yang sama, supaya akurasi
+# prediksi vs aktual rata-rata di atas 86% (rumus akurasi sama dengan di atas:
+# akurasi = 1 - |aktual - prediksi| / |prediksi|). Hanya aktif di mode simulasi.
+# Format pita sama: list of (akurasi_min, akurasi_max, probabilitas), total 1.0.
+SIMULASI_PREDIKSI_AIRPREMA = True
+SIMULASI_AKURASI_AIRPREMA = {
+    "pm1_0" : [(0.80, 0.95, 1.0)],     # rata-rata ~87-88%
+    "pm2_5" : [(0.82, 0.97, 1.0)],     # rata-rata ~89-90%
+    "pm10"  : [(0.84, 0.98, 1.0)],     # rata-rata ~91%
+    "co"    : [(0.81, 0.96, 1.0)],     # rata-rata ~88-89%
+}
+
 
 # ═══════════════════════════════════════════════════════════════════
 # KONFIGURASI SERVER — HANYA predikta.site (independen, satu server)
@@ -1073,6 +1087,8 @@ def tambah_antrian(data_sensor, hasil_svm, hasil_lstm, data_defor,
         },
         # ── Curah hujan (BARU): threshold + confidence/prediksi acak ──
         "hujan"    : hasil_hujan or {},
+        # ── Prediksi khusus airprema (BARU): PM & CO, hanya mode simulasi ──
+        "prediksi_airprema": generate_prediksi_airprema(data_sensor),
         # Status pengiriman independen per server
         "terkirim_predikta": False,
         "terkirim_airprema": False,
@@ -2550,8 +2566,13 @@ def format_payload_airprema(entri):
 
     PENTING: key JSON untuk CO adalah "co" (BUKAN "co_mq7") agar cocok dengan
     kolom `co` di server. Nama field lokal Python (co_mq7) tidak berubah.
+
+    Field tambahan (mode simulasi): prediksi_pm1_0, prediksi_pm2_5, prediksi_pm10,
+    prediksi_co — nilai prediksi tersendiri khusus airprema (lihat
+    generate_prediksi_airprema). Entri lama / data non-simulasi -> semuanya None.
     """
     s = entri.get("sensor", {})
+    pa = entri.get("prediksi_airprema", {}) or {}
     return {
         "api_key"   : AIRPREMA_API_KEY,
         "timestamp" : entri.get("timestamp"),
@@ -2562,6 +2583,10 @@ def format_payload_airprema(entri):
         "pm2_5"     : s.get("pm2_5"),
         "pm10"      : s.get("pm10"),
         "co"        : s.get("co_mq7"),
+        "prediksi_pm1_0": pa.get("pm1_0"),
+        "prediksi_pm2_5": pa.get("pm2_5"),
+        "prediksi_pm10" : pa.get("pm10"),
+        "prediksi_co"   : pa.get("co"),
         "sumber"    : s.get("sumber", "sensor"),
     }
 
@@ -3150,6 +3175,50 @@ def generate_akurasi_baru(pita=None):
     # Fallback jaga-jaga (mis. total probabilitas < 1.0 karena salah config)
     lo, hi, _ = pita[-1]
     return random.uniform(lo, hi)
+
+
+def _prediksi_dari_aktual(aktual, akurasi):
+    """
+    Cari nilai prediksi P yang memenuhi  akurasi = 1 - |aktual - P| / |P|
+    (rumus yang sama dengan akurasi di generate_data_simulasi), arah acak:
+        P >= aktual  ->  P = aktual / akurasi
+        P <  aktual  ->  P = aktual / (2 - akurasi)
+    """
+    if random.random() < 0.5:
+        return aktual / akurasi
+    return aktual / (2.0 - akurasi)
+
+
+def generate_prediksi_airprema(data_sensor):
+    """
+    Prediksi tersendiri khusus airprema.site, HANYA untuk PM1.0/PM2.5/PM10 dan CO.
+    Dihitung dari nilai aktual baris ini (data_sensor) dengan akurasi acak dari
+    SIMULASI_AKURASI_AIRPREMA (rata-rata di atas 86%). Hanya untuk data mode
+    simulasi (sumber == "simulasi") dan kalau SIMULASI_PREDIKSI_AIRPREMA True;
+    selain itu mengembalikan {} (data sensor asli tidak diberi prediksi buatan).
+
+    PM: urutan PM1.0 < PM2.5 < PM10 dan batasnya dijaga _paksa_urutan_pm().
+    CO: dibatasi CO_MIN..CO_MAKS, 3 desimal.
+    Return dict {"pm1_0", "pm2_5", "pm10", "co"} (nilai None kalau aktualnya None).
+    """
+    if not SIMULASI_PREDIKSI_AIRPREMA or data_sensor.get("sumber") != "simulasi":
+        return {}
+
+    hasil = {"pm1_0": None, "pm2_5": None, "pm10": None, "co": None}
+
+    pm_aktual = {k: data_sensor.get(k) for k in ("pm1_0", "pm2_5", "pm10")}
+    if all(v is not None and v > 0 for v in pm_aktual.values()):
+        pm_pred = {k: _prediksi_dari_aktual(v, generate_akurasi_baru(SIMULASI_AKURASI_AIRPREMA[k]))
+                   for k, v in pm_aktual.items()}
+        _paksa_urutan_pm(pm_pred)
+        hasil.update(pm_pred)
+
+    co_aktual = data_sensor.get("co_mq7")
+    if co_aktual is not None and co_aktual > 0:
+        co_pred = _prediksi_dari_aktual(co_aktual, generate_akurasi_baru(SIMULASI_AKURASI_AIRPREMA["co"]))
+        hasil["co"] = round(max(CO_MIN, min(CO_MAKS, co_pred)), 3)
+
+    return hasil
 
 
 def cek_distribusi_akurasi(pita=None, n: int = 10000):
