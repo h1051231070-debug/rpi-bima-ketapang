@@ -2567,9 +2567,10 @@ def format_payload_airprema(entri):
     PENTING: key JSON untuk CO adalah "co" (BUKAN "co_mq7") agar cocok dengan
     kolom `co` di server. Nama field lokal Python (co_mq7) tidak berubah.
 
-    Field tambahan (mode simulasi): prediksi_pm1_0, prediksi_pm2_5, prediksi_pm10,
-    prediksi_co — nilai prediksi tersendiri khusus airprema (lihat
-    generate_prediksi_airprema). Entri lama / data non-simulasi -> semuanya None.
+    Field "prediksi_nilai" (mode simulasi): prediksi tersendiri khusus airprema,
+    {"pm1_0": [...], "pm2_5": [...], "pm10": [...], "co": [...]} — format sama
+    dengan "prediksi_nilai" predikta (lihat generate_prediksi_airprema).
+    Entri lama / data non-simulasi -> None (kolom di database tetap NULL).
     """
     s = entri.get("sensor", {})
     pa = entri.get("prediksi_airprema", {}) or {}
@@ -2583,10 +2584,7 @@ def format_payload_airprema(entri):
         "pm2_5"     : s.get("pm2_5"),
         "pm10"      : s.get("pm10"),
         "co"        : s.get("co_mq7"),
-        "prediksi_pm1_0": pa.get("pm1_0"),
-        "prediksi_pm2_5": pa.get("pm2_5"),
-        "prediksi_pm10" : pa.get("pm10"),
-        "prediksi_co"   : pa.get("co"),
+        "prediksi_nilai": pa or None,
         "sumber"    : s.get("sumber", "sensor"),
     }
 
@@ -3192,31 +3190,58 @@ def _prediksi_dari_aktual(aktual, akurasi):
 def generate_prediksi_airprema(data_sensor):
     """
     Prediksi tersendiri khusus airprema.site, HANYA untuk PM1.0/PM2.5/PM10 dan CO.
-    Dihitung dari nilai aktual baris ini (data_sensor) dengan akurasi acak dari
-    SIMULASI_AKURASI_AIRPREMA (rata-rata di atas 86%). Hanya untuk data mode
-    simulasi (sumber == "simulasi") dan kalau SIMULASI_PREDIKSI_AIRPREMA True;
-    selain itu mengembalikan {} (data sensor asli tidak diberi prediksi buatan).
+    Formatnya sama dengan "prediksi_nilai" predikta (kolom TEXT JSON di database):
+        {"pm1_0": [H+1..H+6], "pm2_5": [...], "pm10": [...], "co": [...]}
+    dengan SIMULASI_HORIZON titik per fitur.
 
-    PM: urutan PM1.0 < PM2.5 < PM10 dan batasnya dijaga _paksa_urutan_pm().
-    CO: dibatasi CO_MIN..CO_MAKS, 3 desimal.
-    Return dict {"pm1_0", "pm2_5", "pm10", "co"} (nilai None kalau aktualnya None).
+    - H+1 dihitung dari nilai aktual baris ini dengan akurasi acak dari
+      SIMULASI_AKURASI_AIRPREMA (rata-rata di atas 86%).
+    - H+2..H+6 melanjutkan H+1 dengan tren pelan acak (tidak ada nilai aktual
+      pembanding untuk waktu yang belum terjadi).
+    Hanya untuk data mode simulasi (sumber == "simulasi") dan kalau
+    SIMULASI_PREDIKSI_AIRPREMA True; selain itu mengembalikan {} (data sensor
+    asli tidak diberi prediksi buatan).
+
+    PM: urutan PM1.0 < PM2.5 < PM10 dan batasnya dijaga _paksa_urutan_pm() di
+    setiap horizon. CO: dibatasi CO_MIN..CO_MAKS, 3 desimal.
+    Fitur yang aktualnya None -> daftar kosong tidak dibuat (key di-skip).
     """
     if not SIMULASI_PREDIKSI_AIRPREMA or data_sensor.get("sumber") != "simulasi":
         return {}
 
-    hasil = {"pm1_0": None, "pm2_5": None, "pm10": None, "co": None}
+    hasil = {}
 
+    # ── PM (tiga fitur sebagai satu kelompok) ──
     pm_aktual = {k: data_sensor.get(k) for k in ("pm1_0", "pm2_5", "pm10")}
     if all(v is not None and v > 0 for v in pm_aktual.values()):
-        pm_pred = {k: _prediksi_dari_aktual(v, generate_akurasi_baru(SIMULASI_AKURASI_AIRPREMA[k]))
-                   for k, v in pm_aktual.items()}
-        _paksa_urutan_pm(pm_pred)
-        hasil.update(pm_pred)
+        # H+1: dari aktual dengan akurasi acak per fitur
+        titik = {k: _prediksi_dari_aktual(v, generate_akurasi_baru(SIMULASI_AKURASI_AIRPREMA[k]))
+                 for k, v in pm_aktual.items()}
+        tren = random.gauss(0, 0.03)            # tren bersama (PM bergerak sebagai kelompok)
+        deret = {k: [] for k in pm_aktual}
+        for h in range(SIMULASI_HORIZON):
+            if h > 0:
+                langkah = 1 + tren + random.gauss(0, 0.02)
+                titik = {k: v * langkah * (1 + random.gauss(0, 0.01)) for k, v in titik.items()}
+            salin = dict(titik)
+            _paksa_urutan_pm(salin)             # bulat, berurutan, batas PM
+            for k in deret:
+                deret[k].append(salin[k])
+            titik = {k: float(salin[k]) for k in titik}   # lanjut dari nilai yang sudah valid
+        hasil.update(deret)
 
+    # ── CO ──
     co_aktual = data_sensor.get("co_mq7")
     if co_aktual is not None and co_aktual > 0:
-        co_pred = _prediksi_dari_aktual(co_aktual, generate_akurasi_baru(SIMULASI_AKURASI_AIRPREMA["co"]))
-        hasil["co"] = round(max(CO_MIN, min(CO_MAKS, co_pred)), 3)
+        nilai = _prediksi_dari_aktual(co_aktual, generate_akurasi_baru(SIMULASI_AKURASI_AIRPREMA["co"]))
+        tren  = random.gauss(0, 0.03)
+        deret = []
+        for h in range(SIMULASI_HORIZON):
+            if h > 0:
+                nilai = nilai * (1 + tren + random.gauss(0, 0.03))
+            nilai = max(CO_MIN, min(CO_MAKS, nilai))
+            deret.append(round(nilai, 3))
+        hasil["co"] = deret
 
     return hasil
 
