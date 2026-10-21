@@ -418,10 +418,18 @@ INTERVAL_BACA      = 30   # 5 menit
 # Boleh lebih jarang dari baca sensor untuk hemat kuota
 INTERVAL_KIRIM     = 30
 
-# Mode dummy — True = gunakan data sensor palsu (untuk testing tanpa hardware)
-# 🔹 True  = mode dummy (testing di laptop, tidak perlu sensor fisik)
-# 🔹 False = mode nyata (gunakan sensor fisik DS18B20, SHT31, PMS5003T, JSN-SR04T, MQ-7)
-MODE_DUMMY         = False   # ← ganti False saat sensor sudah terpasang
+# ── SAKLAR UTAMA SENSOR NYATA ────────────────────────────────────────
+# 🔹 False (BAWAAN) = kode TIDAK menyentuh hardware sama sekali: tidak ada impor
+#                     RPi.GPIO / board / busio / serial / smbus2, tidak ada akses
+#                     1-Wire (/sys/bus/w1), I2C, UART, maupun GPIO. Data sensor
+#                     datang dari generator dummy.
+# 🔹 True           = baca sensor fisik (DS18B20, SHT31, PMS5003T, hujan, dst.).
+# Tulis True HANYA saat sensor sudah benar-benar terpasang.
+MODE_SENSOR_NYATA  = False
+
+# Turunan dari saklar di atas — JANGAN diubah manual.
+# True = mode dummy (tanpa hardware), False = mode sensor nyata.
+MODE_DUMMY         = not MODE_SENSOR_NYATA
 
 # Mode simulasi/demo (lihat simulasi.py) — SAKLAR KODE, alternatif dari flag
 # CLI "--simulasi" (berguna kalau dijalankan dari Thonny/IDE lewat F5 tanpa
@@ -1168,10 +1176,10 @@ def hitung_total():
 #
 # sensor.py — Pembacaan sensor dan mode dummy (PREDIKTA)
 #
-# MODE_DUMMY = True  → generate data sensor realistis (untuk testing)
-# MODE_DUMMY = False → baca sensor fisik DS18B20, SHT31, PMS5003T, JSN-SR04T, MQ-7 (ADS1115)
+# MODE_SENSOR_NYATA = False (bawaan) → generate data sensor realistis, TANPA menyentuh hardware
+# MODE_SENSOR_NYATA = True            → baca sensor fisik DS18B20, SHT31, PMS5003T, JSN-SR04T, MQ-7 (ADS1115)
 #
-# Untuk beralih ke sensor nyata: ubah MODE_DUMMY = False di config.py
+# Untuk beralih ke sensor nyata: tulis MODE_SENSOR_NYATA = True (di bagian konfigurasi atas file)
 # Tidak ada perubahan kode lain yang diperlukan.
 #
 # BARU: sensor CURAH HUJAN tipping bucket (3 pin: VCC 3V3, GND, PULSE -> GPIO17), dihitung
@@ -1457,6 +1465,8 @@ _ads_channel = None   # cache objek AnalogIn ADS1115 (MQ-7), dibuat sekali saja
 def _init_gpio():
     """Inisialisasi GPIO untuk JSN-SR04T (hanya sekali)."""
     global _gpio
+    if not MODE_SENSOR_NYATA:
+        return None          # saklar sensor nyata OFF: hardware tidak disentuh
     if _gpio is not None:
         return _gpio
     try:
@@ -1476,6 +1486,8 @@ def _init_gpio():
 def _init_ads1115():
     """Inisialisasi channel ADS1115 untuk MQ-7 (hanya sekali)."""
     global _ads_channel
+    if not MODE_SENSOR_NYATA:
+        return None          # saklar sensor nyata OFF: hardware tidak disentuh
     if _ads_channel is not None:
         return _ads_channel
     try:
@@ -1585,6 +1597,8 @@ def _hujan_polling_loop(GPIO, edge_nama):
 def _init_hujan():
     """Inisialisasi GPIO + interrupt untuk sensor hujan (hanya sekali)."""
     st = _hujan_state
+    if not MODE_SENSOR_NYATA:
+        return None          # saklar sensor nyata OFF: hardware tidak disentuh
     if st["gpio"] is not None:
         return st["gpio"]
     if st["gagal"]:
@@ -1624,6 +1638,8 @@ def _baca_hujan():
     Return None jika dinonaktifkan (HUJAN_ENABLE=False) atau GPIO gagal;
     0.0 berarti sensor hidup tapi tidak ada hujan.
     """
+    if not MODE_SENSOR_NYATA:
+        return None          # saklar sensor nyata OFF: GPIO tidak disentuh
     if not HUJAN_ENABLE:
         return None
     if not HUJAN_STATE["baca"]:
@@ -1656,6 +1672,8 @@ def _cleanup_hujan():
 
 def _baca_ds18b20():
     """Baca suhu dari DS18B20 via 1-Wire kernel Linux."""
+    if not MODE_SENSOR_NYATA:
+        return None          # saklar sensor nyata OFF: /sys/bus/w1 tidak disentuh
     try:
         if not os.path.exists(W1_BASE):
             return None
@@ -1674,6 +1692,8 @@ def _baca_ds18b20():
 
 def _baca_sht31():
     """Baca kelembapan dari GY-SHT31 via I²C. Suhu diabaikan."""
+    if not MODE_SENSOR_NYATA:
+        return None          # saklar sensor nyata OFF: bus I2C tidak disentuh
     try:
         import smbus2
         bus  = smbus2.SMBus(SHT31_BUS)
@@ -1689,6 +1709,8 @@ def _baca_sht31():
 
 def _baca_pms5003t():
     """Baca PM1.0, PM2.5, PM10 dari PMS5003T via UART."""
+    if not MODE_SENSOR_NYATA:
+        return None, None, None   # saklar sensor nyata OFF: port serial tidak disentuh
     try:
         import serial
         ser      = serial.Serial(PMS_PORT, baudrate=PMS_BAUD, timeout=2)
@@ -1726,6 +1748,11 @@ def _baca_jsn():
 
 def _baca_sensor_nyata():
     """Baca semua sensor fisik. Return dict dengan None jika sensor gagal."""
+    if not MODE_SENSOR_NYATA:
+        # Saklar OFF: tidak ada satu pun sensor yang dibaca -> semua None
+        return {"suhu": None, "kelembapan": None, "pm1_0": None, "pm2_5": None,
+                "pm10": None, "tinggi_air": None, "co_mq7": None,
+                "curah_hujan": None, "sumber": "sensor"}
     suhu    = _baca_ds18b20()
     rh      = _baca_sht31()
     pm1, pm25, pm10 = _baca_pms5003t()
@@ -1753,7 +1780,7 @@ def baca_sensor():
     """
     Fungsi utama pembacaan sensor.
     Secara otomatis memilih mode dummy atau sensor nyata
-    berdasarkan MODE_DUMMY di config.py.
+    berdasarkan MODE_SENSOR_NYATA (sensor fisik HANYA dibaca kalau True).
 
     Return:
         dict berisi semua nilai sensor (termasuk co_mq7) + timestamp + sumber
@@ -1765,7 +1792,7 @@ def baca_sensor():
     nyata, nilainya diisi otomatis dari tabel suhu per jam (lihat
     _isi_fallback_suhu_rh) selama SUHU_RH_FALLBACK_SIMULASI = True.
     """
-    if MODE_DUMMY:
+    if MODE_DUMMY or not MODE_SENSOR_NYATA:   # sensor fisik HANYA dibaca kalau MODE_SENSOR_NYATA = True
         _FALLBACK_AKTIF["suhu"]       = False
         _FALLBACK_AKTIF["kelembapan"] = False
         data = _dummy_sensor()
@@ -1785,6 +1812,8 @@ def baca_sensor():
 def cleanup_gpio():
     """Bersihkan GPIO saat program selesai."""
     global _gpio
+    if not MODE_SENSOR_NYATA:
+        return               # saklar sensor nyata OFF: tidak ada GPIO yang perlu dibersihkan
     _cleanup_hujan()
     if _gpio is not None:
         try:
